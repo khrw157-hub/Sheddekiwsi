@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Team SHD Bot - Single-file Railway build.
+"""Team SHD Bot - Railway build.
+Single-file Telegram bot with platform groups and a common/public group.
 All user-facing text is UTF-8 Arabic. No emoji are used.
 """
+
 import os
 import json
 import logging
@@ -9,8 +11,19 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 from telegram.error import TelegramError
 
 logging.basicConfig(
@@ -24,6 +37,7 @@ log = logging.getLogger(__name__)
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
 try:
     FOUNDER_ID = int(os.getenv("FOUNDER_ID", "0") or 0)
 except ValueError:
@@ -33,8 +47,12 @@ DB_PATH = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in environment variables.")
+
 if not FOUNDER_ID:
     raise RuntimeError("FOUNDER_ID is not set in environment variables.")
+
+PLATFORMS = ("telegram", "instagram", "tiktok")
+COMMON_PLATFORM = "common"
 
 # ============================================================
 # Database
@@ -129,7 +147,8 @@ class Database:
                 created_at TEXT NOT NULL
             );
             """)
-            for platform in ("telegram", "instagram", "tiktok"):
+
+            for platform in PLATFORMS:
                 con.execute(
                     "INSERT OR IGNORE INTO platforms(name, enabled) VALUES(?, 1)",
                     (platform,),
@@ -139,9 +158,17 @@ class Database:
         try:
             with self.conn() as con:
                 con.execute(
-                    """INSERT INTO logs(level,event,user_id,request_id,details,created_at)
-                       VALUES(?,?,?,?,?,?)""",
-                    (level, event, user_id, request_id, details, now_iso()),
+                    """INSERT INTO logs(
+                        level,event,user_id,request_id,details,created_at
+                    ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        level,
+                        event,
+                        user_id,
+                        request_id,
+                        details,
+                        now_iso(),
+                    ),
                 )
         except Exception:
             log.exception("Could not write application log")
@@ -156,36 +183,58 @@ class Database:
     def add_user(self, user_id, username, full_name, role="member"):
         with self.conn() as con:
             con.execute(
-                """INSERT INTO users(user_id,username,full_name,role,active,created_at)
-                   VALUES(?,?,?,?,1,?)
-                   ON CONFLICT(user_id) DO UPDATE SET
-                     username=excluded.username,
-                     full_name=excluded.full_name,
-                     role=excluded.role,
-                     active=1""",
-                (user_id, username, full_name, role, now_iso()),
+                """INSERT INTO users(
+                    user_id,username,full_name,role,active,created_at
+                )
+                VALUES(?,?,?,?,1,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    full_name=excluded.full_name,
+                    role=excluded.role,
+                    active=1""",
+                (
+                    user_id,
+                    username,
+                    full_name,
+                    role,
+                    now_iso(),
+                ),
             )
 
     def remove_user(self, user_id):
         with self.conn() as con:
-            con.execute("UPDATE users SET active=0 WHERE user_id=?", (user_id,))
-            con.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+            con.execute(
+                "UPDATE users SET active=0 WHERE user_id=?",
+                (user_id,),
+            )
+            con.execute(
+                "UPDATE admins SET active=0 WHERE user_id=?",
+                (user_id,),
+            )
 
     def list_users(self):
         with self.conn() as con:
             return con.execute(
-                "SELECT * FROM users WHERE active=1 ORDER BY created_at DESC"
+                """SELECT * FROM users
+                   WHERE active=1
+                   ORDER BY created_at DESC"""
             ).fetchall()
 
     def add_admin(self, user_id, platform):
         with self.conn() as con:
             con.execute(
-                """INSERT INTO admins(user_id,platform,active,created_at)
-                   VALUES(?,?,1,?)
-                   ON CONFLICT(user_id) DO UPDATE SET
-                     platform=excluded.platform,
-                     active=1""",
-                (user_id, platform, now_iso()),
+                """INSERT INTO admins(
+                    user_id,platform,active,created_at
+                )
+                VALUES(?,?,1,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    platform=excluded.platform,
+                    active=1""",
+                (
+                    user_id,
+                    platform,
+                    now_iso(),
+                ),
             )
             con.execute(
                 "UPDATE users SET role='admin', active=1 WHERE user_id=?",
@@ -194,7 +243,10 @@ class Database:
 
     def remove_admin(self, user_id):
         with self.conn() as con:
-            con.execute("UPDATE admins SET active=0 WHERE user_id=?", (user_id,))
+            con.execute(
+                "UPDATE admins SET active=0 WHERE user_id=?",
+                (user_id,),
+            )
             con.execute(
                 "UPDATE users SET role='member' WHERE user_id=? AND active=1",
                 (user_id,),
@@ -204,11 +256,17 @@ class Database:
         with self.conn() as con:
             if platform:
                 return con.execute(
-                    "SELECT * FROM admins WHERE user_id=? AND platform=? AND active=1",
-                    (user_id, platform),
+                    """SELECT * FROM admins
+                       WHERE user_id=? AND platform=? AND active=1""",
+                    (
+                        user_id,
+                        platform,
+                    ),
                 ).fetchone()
+
             return con.execute(
-                "SELECT * FROM admins WHERE user_id=? AND active=1",
+                """SELECT * FROM admins
+                   WHERE user_id=? AND active=1""",
                 (user_id,),
             ).fetchone()
 
@@ -225,10 +283,16 @@ class Database:
     def set_group(self, platform, chat_id):
         with self.conn() as con:
             con.execute(
-                """INSERT INTO groups_config(platform,chat_id)
-                   VALUES(?,?)
-                   ON CONFLICT(platform) DO UPDATE SET chat_id=excluded.chat_id""",
-                (platform, chat_id),
+                """INSERT INTO groups_config(
+                    platform,chat_id,previous_permissions
+                )
+                VALUES(?,?,NULL)
+                ON CONFLICT(platform) DO UPDATE SET
+                    chat_id=excluded.chat_id""",
+                (
+                    platform,
+                    chat_id,
+                ),
             )
 
     def get_group(self, platform):
@@ -241,24 +305,34 @@ class Database:
     def set_previous_permissions(self, platform, permissions_json):
         with self.conn() as con:
             con.execute(
-                "UPDATE groups_config SET previous_permissions=? WHERE platform=?",
-                (permissions_json, platform),
+                """UPDATE groups_config
+                   SET previous_permissions=?
+                   WHERE platform=?""",
+                (
+                    permissions_json,
+                    platform,
+                ),
             )
 
     def clear_previous_permissions(self, platform):
         with self.conn() as con:
             con.execute(
-                "UPDATE groups_config SET previous_permissions=NULL WHERE platform=?",
+                """UPDATE groups_config
+                   SET previous_permissions=NULL
+                   WHERE platform=?""",
                 (platform,),
             )
 
     def create_request(self, platform, user_id, username, data):
         created = now_iso()
+
         with self.conn() as con:
             cur = con.execute(
                 """INSERT INTO requests(
-                    platform,user_id,username,data_json,status,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?)""",
+                    platform,user_id,username,data_json,status,
+                    created_at,updated_at
+                )
+                VALUES(?,?,?,?,?,?,?)""",
                 (
                     platform,
                     user_id,
@@ -278,12 +352,23 @@ class Database:
                 (request_id,),
             ).fetchone()
 
-    def transition_request(self, request_id, from_status, to_status, user_id, action):
+    def transition_request(
+        self,
+        request_id,
+        from_status,
+        to_status,
+        user_id,
+        action,
+    ):
         with self.conn() as con:
             con.execute("BEGIN IMMEDIATE")
+
             cur = con.execute(
                 f"""UPDATE requests
-                    SET status=?, {action}_by=?, {action}_at=?, updated_at=?
+                    SET status=?,
+                        {action}_by=?,
+                        {action}_at=?,
+                        updated_at=?
                     WHERE id=? AND status=?""",
                 (
                     to_status,
@@ -294,46 +379,81 @@ class Database:
                     from_status,
                 ),
             )
+
             return cur.rowcount == 1
 
     def reject_request(self, request_id, user_id):
         with self.conn() as con:
             con.execute("BEGIN IMMEDIATE")
+
             cur = con.execute(
                 """UPDATE requests
-                   SET status='REJECTED', approved_by=?, approved_at=?, updated_at=?
+                   SET status='REJECTED',
+                       approved_by=?,
+                       approved_at=?,
+                       updated_at=?
                    WHERE id=? AND status='PENDING'""",
-                (user_id, now_iso(), now_iso(), request_id),
+                (
+                    user_id,
+                    now_iso(),
+                    now_iso(),
+                    request_id,
+                ),
             )
+
             if cur.rowcount == 1:
                 con.execute(
                     """INSERT INTO logs(
                         level,event,user_id,request_id,details,created_at
-                    ) VALUES(?,?,?,?,?,?)""",
-                    ("INFO", "request_rejected", user_id, request_id, None, now_iso()),
+                    )
+                    VALUES(?,?,?,?,?,?)""",
+                    (
+                        "INFO",
+                        "request_rejected",
+                        user_id,
+                        request_id,
+                        None,
+                        now_iso(),
+                    ),
                 )
+
             return cur.rowcount == 1
 
     def set_request_status(self, request_id, status):
         with self.conn() as con:
             con.execute(
-                "UPDATE requests SET status=?, updated_at=? WHERE id=?",
-                (status, now_iso(), request_id),
+                """UPDATE requests
+                   SET status=?, updated_at=?
+                   WHERE id=?""",
+                (
+                    status,
+                    now_iso(),
+                    request_id,
+                ),
             )
 
     def set_group_message(self, request_id, chat_id, message_id):
         with self.conn() as con:
             con.execute(
                 """UPDATE requests
-                   SET group_chat_id=?, group_message_id=?, updated_at=?
+                   SET group_chat_id=?,
+                       group_message_id=?,
+                       updated_at=?
                    WHERE id=?""",
-                (chat_id, message_id, now_iso(), request_id),
+                (
+                    chat_id,
+                    message_id,
+                    now_iso(),
+                    request_id,
+                ),
             )
 
     def list_requests(self, limit=50):
         with self.conn() as con:
             return con.execute(
-                "SELECT * FROM requests ORDER BY id DESC LIMIT ?",
+                """SELECT * FROM requests
+                   ORDER BY id DESC
+                   LIMIT ?""",
                 (limit,),
             ).fetchall()
 
@@ -351,19 +471,23 @@ class Database:
                 "SELECT * FROM sessions WHERE user_id=?",
                 (user_id,),
             ).fetchone()
+
             if not row:
                 return None
+
             return row["state"], json.loads(row["data_json"])
 
     def set_session(self, user_id, state, data=None):
         with self.conn() as con:
             con.execute(
-                """INSERT INTO sessions(user_id,state,data_json,updated_at)
-                   VALUES(?,?,?,?)
-                   ON CONFLICT(user_id) DO UPDATE SET
-                     state=excluded.state,
-                     data_json=excluded.data_json,
-                     updated_at=excluded.updated_at""",
+                """INSERT INTO sessions(
+                    user_id,state,data_json,updated_at
+                )
+                VALUES(?,?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    state=excluded.state,
+                    data_json=excluded.data_json,
+                    updated_at=excluded.updated_at""",
                 (
                     user_id,
                     state,
@@ -374,7 +498,10 @@ class Database:
 
     def clear_session(self, user_id):
         with self.conn() as con:
-            con.execute("DELETE FROM sessions WHERE user_id=?",(user_id,))
+            con.execute(
+                "DELETE FROM sessions WHERE user_id=?",
+                (user_id,),
+            )
 
 
 db = Database(DB_PATH)
@@ -385,76 +512,174 @@ db = Database(DB_PATH)
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Telegram", callback_data="platform:telegram")],
-        [InlineKeyboardButton("Instagram", callback_data="platform:instagram")],
-        [InlineKeyboardButton("TikTok", callback_data="platform:tiktok")],
+        [InlineKeyboardButton(
+            "Telegram",
+            callback_data="platform:telegram",
+        )],
+        [InlineKeyboardButton(
+            "Instagram",
+            callback_data="platform:instagram",
+        )],
+        [InlineKeyboardButton(
+            "TikTok",
+            callback_data="platform:tiktok",
+        )],
     ])
 
 
 def cancel_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("إلغاء", callback_data="cancel")]
+        [InlineKeyboardButton(
+            "إلغاء",
+            callback_data="cancel",
+        )]
     ])
 
 
 def admin_request_keyboard(request_id):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("قبول الشد", callback_data=f"approve:{request_id}"),
-        InlineKeyboardButton("رفض الشد", callback_data=f"reject:{request_id}"),
+        InlineKeyboardButton(
+            "قبول الشد",
+            callback_data=f"approve:{request_id}",
+        ),
+        InlineKeyboardButton(
+            "رفض الشد",
+            callback_data=f"reject:{request_id}",
+        ),
     ]])
 
 
 def finish_keyboard(request_id):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("انتهاء الشد", callback_data=f"finish:{request_id}")
+        InlineKeyboardButton(
+            "انتهاء الشد",
+            callback_data=f"finish:{request_id}",
+        )
     ]])
 
 
 def founder_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("إدارة الأعضاء", callback_data="founder:users")],
-        [InlineKeyboardButton("إدارة المشرفين", callback_data="founder:admins")],
-        [InlineKeyboardButton("إدارة المنصات", callback_data="founder:platforms")],
-        [InlineKeyboardButton("إدارة الكروبات", callback_data="founder:groups")],
-        [InlineKeyboardButton("الطلبات", callback_data="founder:requests")],
-        [InlineKeyboardButton("الإحصائيات", callback_data="founder:stats")],
-        [InlineKeyboardButton("الإعدادات", callback_data="founder:settings")],
+        [InlineKeyboardButton(
+            "إدارة الأعضاء",
+            callback_data="founder:users",
+        )],
+        [InlineKeyboardButton(
+            "إدارة المشرفين",
+            callback_data="founder:admins",
+        )],
+        [InlineKeyboardButton(
+            "إدارة المنصات",
+            callback_data="founder:platforms",
+        )],
+        [InlineKeyboardButton(
+            "إدارة الكروبات",
+            callback_data="founder:groups",
+        )],
+        [InlineKeyboardButton(
+            "الطلبات",
+            callback_data="founder:requests",
+        )],
+        [InlineKeyboardButton(
+            "الإحصائيات",
+            callback_data="founder:stats",
+        )],
+        [InlineKeyboardButton(
+            "الإعدادات",
+            callback_data="founder:settings",
+        )],
     ])
 
 
 def founder_users_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("إضافة عضو", callback_data="f:add_user")],
-        [InlineKeyboardButton("حذف عضو", callback_data="f:remove_user")],
-        [InlineKeyboardButton("قائمة الأعضاء", callback_data="f:list_users")],
-        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+        [InlineKeyboardButton(
+            "إضافة عضو",
+            callback_data="f:add_user",
+        )],
+        [InlineKeyboardButton(
+            "حذف عضو",
+            callback_data="f:remove_user",
+        )],
+        [InlineKeyboardButton(
+            "قائمة الأعضاء",
+            callback_data="f:list_users",
+        )],
+        [InlineKeyboardButton(
+            "رجوع",
+            callback_data="founder:home",
+        )],
     ])
 
 
 def founder_admins_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("إضافة مشرف", callback_data="f:add_admin")],
-        [InlineKeyboardButton("حذف مشرف", callback_data="f:remove_admin")],
-        [InlineKeyboardButton("قائمة المشرفين", callback_data="f:list_admins")],
-        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+        [InlineKeyboardButton(
+            "إضافة مشرف",
+            callback_data="f:add_admin",
+        )],
+        [InlineKeyboardButton(
+            "حذف مشرف",
+            callback_data="f:remove_admin",
+        )],
+        [InlineKeyboardButton(
+            "قائمة المشرفين",
+            callback_data="f:list_admins",
+        )],
+        [InlineKeyboardButton(
+            "رجوع",
+            callback_data="founder:home",
+        )],
     ])
 
 
 def founder_groups_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("تعيين كروب Telegram", callback_data="f:set_group:telegram")],
-        [InlineKeyboardButton("تعيين كروب Instagram", callback_data="f:set_group:instagram")],
-        [InlineKeyboardButton("تعيين كروب TikTok", callback_data="f:set_group:tiktok")],
-        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+        [InlineKeyboardButton(
+            "تعيين كروب Telegram",
+            callback_data="f:set_group:telegram",
+        )],
+        [InlineKeyboardButton(
+            "تعيين كروب Instagram",
+            callback_data="f:set_group:instagram",
+        )],
+        [InlineKeyboardButton(
+            "تعيين كروب TikTok",
+            callback_data="f:set_group:tiktok",
+        )],
+        [InlineKeyboardButton(
+            "تعيين الكروب العام",
+            callback_data="f:set_group:common",
+        )],
+        [InlineKeyboardButton(
+            "عرض الكروبات",
+            callback_data="f:list_groups",
+        )],
+        [InlineKeyboardButton(
+            "رجوع",
+            callback_data="founder:home",
+        )],
     ])
 
 
 def founder_platforms_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Telegram", callback_data="f:platform:telegram")],
-        [InlineKeyboardButton("Instagram", callback_data="f:platform:instagram")],
-        [InlineKeyboardButton("TikTok", callback_data="f:platform:tiktok")],
-        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+        [InlineKeyboardButton(
+            "Telegram",
+            callback_data="f:platform:telegram",
+        )],
+        [InlineKeyboardButton(
+            "Instagram",
+            callback_data="f:platform:instagram",
+        )],
+        [InlineKeyboardButton(
+            "TikTok",
+            callback_data="f:platform:tiktok",
+        )],
+        [InlineKeyboardButton(
+            "رجوع",
+            callback_data="founder:home",
+        )],
     ])
 
 # ============================================================
@@ -467,12 +692,19 @@ def row_data(row):
 
 def format_request(request):
     data = row_data(request)
-    lines = [f"{request['platform'].upper()} SHD", ""]
+
+    lines = [
+        f"{request['platform'].upper()} SHD",
+        "",
+    ]
+
     for key, value in data.items():
         lines.append(f"{key}:")
         lines.append(str(value))
         lines.append("")
+
     lines.append(f"رقم الطلب: {request['id']}")
+
     return "\n".join(lines).strip()
 
 
@@ -493,6 +725,7 @@ def permissions_to_json(permissions):
         "can_pin_messages": permissions.can_pin_messages,
         "can_manage_topics": permissions.can_manage_topics,
     }
+
     return json.dumps(values, ensure_ascii=False)
 
 
@@ -503,9 +736,15 @@ def permissions_from_json(raw):
 
 async def lock_group(bot, platform, chat_id):
     chat = await bot.get_chat(chat_id)
+
     if not chat.permissions:
         raise RuntimeError("تعذر قراءة صلاحيات الكروب.")
-    db.set_previous_permissions(platform, permissions_to_json(chat.permissions))
+
+    db.set_previous_permissions(
+        platform,
+        permissions_to_json(chat.permissions),
+    )
+
     locked = ChatPermissions(
         can_send_messages=False,
         can_send_audios=False,
@@ -522,6 +761,7 @@ async def lock_group(bot, platform, chat_id):
         can_pin_messages=False,
         can_manage_topics=False,
     )
+
     await bot.set_chat_permissions(
         chat_id,
         locked,
@@ -531,8 +771,11 @@ async def lock_group(bot, platform, chat_id):
 
 async def unlock_group(bot, platform, chat_id):
     group = db.get_group(platform)
+
     if group and group["previous_permissions"]:
-        permissions = permissions_from_json(group["previous_permissions"])
+        permissions = permissions_from_json(
+            group["previous_permissions"]
+        )
     else:
         permissions = ChatPermissions(
             can_send_messages=True,
@@ -546,12 +789,54 @@ async def unlock_group(bot, platform, chat_id):
             can_send_other_messages=True,
             can_add_web_page_previews=True,
         )
+
     await bot.set_chat_permissions(
         chat_id,
         permissions,
         use_independent_chat_permissions=True,
     )
+
     db.clear_previous_permissions(platform)
+
+
+async def send_to_common_group(bot, request):
+    group = db.get_group(COMMON_PLATFORM)
+
+    if not group:
+        return None
+
+    try:
+        message = await bot.send_message(
+            group["chat_id"],
+            format_request(request),
+        )
+
+        try:
+            await bot.pin_chat_message(
+                group["chat_id"],
+                message.message_id,
+                disable_notification=True,
+            )
+        except TelegramError as exc:
+            db.log_event(
+                "ERROR",
+                "common_group_pin_failed",
+                None,
+                request["id"],
+                str(exc),
+            )
+
+        return message
+
+    except TelegramError as exc:
+        db.log_event(
+            "ERROR",
+            "common_group_send_failed",
+            None,
+            request["id"],
+            str(exc),
+        )
+        return None
 
 # ============================================================
 # Platform workflows
@@ -568,7 +853,11 @@ TIKTOK_DATA = "WAITING_TIKTOK_DATA"
 
 
 async def start_telegram(user_id):
-    db.set_session(user_id, TELEGRAM_COPY, {})
+    db.set_session(
+        user_id,
+        TELEGRAM_COPY,
+        {},
+    )
     return "أرسل الكليشة.", cancel_keyboard()
 
 
@@ -578,12 +867,20 @@ async def telegram_text(user_id, state, text):
 
     if state == TELEGRAM_COPY:
         data["الكليشة"] = text
-        db.set_session(user_id, TELEGRAM_TITLE, data)
+        db.set_session(
+            user_id,
+            TELEGRAM_TITLE,
+            data,
+        )
         return "أرسل العنوان.", cancel_keyboard()
 
     if state == TELEGRAM_TITLE:
         data["العنوان"] = text
-        db.set_session(user_id, TELEGRAM_EMAIL, data)
+        db.set_session(
+            user_id,
+            TELEGRAM_EMAIL,
+            data,
+        )
         return "أرسل البريد الإلكتروني.", cancel_keyboard()
 
     if state == TELEGRAM_EMAIL:
@@ -595,7 +892,11 @@ async def telegram_text(user_id, state, text):
 
 
 async def start_instagram(user_id):
-    db.set_session(user_id, INSTAGRAM_USERNAME, {})
+    db.set_session(
+        user_id,
+        INSTAGRAM_USERNAME,
+        {},
+    )
     return "أرسل يوزر الحساب.", cancel_keyboard()
 
 
@@ -605,12 +906,23 @@ async def instagram_text(user_id, state, text):
 
     if state == INSTAGRAM_USERNAME:
         username = text.strip().lstrip("@").strip()
-        if not username or " " in username or "/" in username:
+
+        if (
+            not username
+            or " " in username
+            or "/" in username
+        ):
             return "أرسل اليوزر بشكل صحيح.", cancel_keyboard()
 
         data["Username"] = f"@{username}"
         data["Instagram"] = f"https://instagram.com/{username}"
-        db.set_session(user_id, INSTAGRAM_SHD, data)
+
+        db.set_session(
+            user_id,
+            INSTAGRAM_SHD,
+            data,
+        )
+
         return "أرسل شدتك.", cancel_keyboard()
 
     if state == INSTAGRAM_SHD:
@@ -622,17 +934,26 @@ async def instagram_text(user_id, state, text):
 
 
 async def start_tiktok(user_id):
-    db.set_session(user_id, TIKTOK_DATA, {})
+    db.set_session(
+        user_id,
+        TIKTOK_DATA,
+        {},
+    )
     return "أرسل بيانات شد TikTok.", cancel_keyboard()
 
 
 async def tiktok_text(user_id, state, text):
     if state != TIKTOK_DATA:
         return None, None
+
     if not text.strip():
         return "أرسل بيانات الشد.", cancel_keyboard()
+
     db.clear_session(user_id)
-    return {"بيانات الشد": text.strip()}, None
+
+    return {
+        "بيانات الشد": text.strip()
+    }, None
 
 # ============================================================
 # Common request flow
@@ -640,12 +961,17 @@ async def tiktok_text(user_id, state, text):
 
 async def send_request_to_admins(bot, request_id, platform):
     request = db.get_request(request_id)
+
+    if not request:
+        return 0
+
     text = format_request(request)
     sent = 0
 
     for admin in db.list_admins():
         if admin["platform"] != platform:
             continue
+
         try:
             await bot.send_message(
                 admin["user_id"],
@@ -653,6 +979,7 @@ async def send_request_to_admins(bot, request_id, platform):
                 reply_markup=admin_request_keyboard(request_id),
             )
             sent += 1
+
         except TelegramError as exc:
             db.log_event(
                 "ERROR",
@@ -661,6 +988,7 @@ async def send_request_to_admins(bot, request_id, platform):
                 request_id,
                 str(exc),
             )
+
     return sent
 
 
@@ -669,11 +997,15 @@ async def platform_callback(update, context):
     await query.answer()
 
     user_id = query.from_user.id
+
     if not db.get_user(user_id):
-        await query.edit_message_text("لا تملك صلاحية استخدام البوت.")
+        await query.edit_message_text(
+            "لا تملك صلاحية استخدام البوت."
+        )
         return
 
     platform = query.data.split(":", 1)[1]
+
     db.clear_session(user_id)
 
     if platform == "telegram":
@@ -683,18 +1015,26 @@ async def platform_callback(update, context):
     else:
         message, keyboard = await start_tiktok(user_id)
 
-    await query.edit_message_text(message, reply_markup=keyboard)
+    await query.edit_message_text(
+        message,
+        reply_markup=keyboard,
+    )
 
 
 async def cancel_callback(update, context):
     query = update.callback_query
     await query.answer()
 
-    if not db.get_user(query.from_user.id):
-        await query.edit_message_text("لا تملك صلاحية استخدام البوت.")
+    user_id = query.from_user.id
+
+    if not db.get_user(user_id):
+        await query.edit_message_text(
+            "لا تملك صلاحية استخدام البوت."
+        )
         return
 
-    db.clear_session(query.from_user.id)
+    db.clear_session(user_id)
+
     await query.edit_message_text(
         "تم إلغاء العملية.",
         reply_markup=main_keyboard(),
@@ -706,11 +1046,15 @@ async def text_router(update, context):
         return
 
     user_id = update.effective_user.id
+
     if not db.get_user(user_id):
-        await update.message.reply_text("لا تملك صلاحية استخدام البوت.")
+        await update.message.reply_text(
+            "لا تملك صلاحية استخدام البوت."
+        )
         return
 
     session = db.get_session(user_id)
+
     if not session:
         await update.message.reply_text(
             "اختر المنصة.",
@@ -721,17 +1065,40 @@ async def text_router(update, context):
     state, _ = session
     text = update.message.text
 
-    if state in (TELEGRAM_COPY, TELEGRAM_TITLE, TELEGRAM_EMAIL):
-        message, keyboard = await telegram_text(user_id, state, text)
+    if state in (
+        TELEGRAM_COPY,
+        TELEGRAM_TITLE,
+        TELEGRAM_EMAIL,
+    ):
+        message, keyboard = await telegram_text(
+            user_id,
+            state,
+            text,
+        )
         platform = "telegram"
-    elif state in (INSTAGRAM_USERNAME, INSTAGRAM_SHD):
-        message, keyboard = await instagram_text(user_id, state, text)
+
+    elif state in (
+        INSTAGRAM_USERNAME,
+        INSTAGRAM_SHD,
+    ):
+        message, keyboard = await instagram_text(
+            user_id,
+            state,
+            text,
+        )
         platform = "instagram"
+
     elif state == TIKTOK_DATA:
-        message, keyboard = await tiktok_text(user_id, state, text)
+        message, keyboard = await tiktok_text(
+            user_id,
+            state,
+            text,
+        )
         platform = "tiktok"
+
     else:
         db.clear_session(user_id)
+
         await update.message.reply_text(
             "انتهت العملية. اختر المنصة.",
             reply_markup=main_keyboard(),
@@ -746,9 +1113,18 @@ async def text_router(update, context):
             message,
         )
 
-        sent = await send_request_to_admins(context.bot, request_id, platform)
+        sent = await send_request_to_admins(
+            context.bot,
+            request_id,
+            platform,
+        )
+
         if sent == 0:
-            db.set_request_status(request_id, "REJECTED")
+            db.set_request_status(
+                request_id,
+                "REJECTED",
+            )
+
             db.log_event(
                 "ERROR",
                 "no_platform_admin",
@@ -756,6 +1132,7 @@ async def text_router(update, context):
                 request_id,
                 platform,
             )
+
             await update.message.reply_text(
                 "تعذر إرسال الشدة للمشرفين حاليًا. حاول لاحقًا.",
                 reply_markup=main_keyboard(),
@@ -768,7 +1145,10 @@ async def text_router(update, context):
         )
         return
 
-    await update.message.reply_text(message, reply_markup=keyboard)
+    await update.message.reply_text(
+        message,
+        reply_markup=keyboard,
+    )
 
 # ============================================================
 # Admin request actions
@@ -779,22 +1159,40 @@ async def approve_callback(update, context):
     user_id = query.from_user.id
 
     try:
-        request_id = int(query.data.split(":", 1)[1])
+        request_id = int(
+            query.data.split(":", 1)[1]
+        )
     except (ValueError, IndexError):
-        await query.answer("رقم الطلب غير صحيح.", show_alert=True)
+        await query.answer(
+            "رقم الطلب غير صحيح.",
+            show_alert=True,
+        )
         return
 
     request = db.get_request(request_id)
+
     if not request:
-        await query.answer("الطلب غير موجود.", show_alert=True)
+        await query.answer(
+            "الطلب غير موجود.",
+            show_alert=True,
+        )
         return
 
-    if not db.get_admin(user_id, request["platform"]):
-        await query.answer("لا تملك صلاحية هذه المنصة.", show_alert=True)
+    if not db.get_admin(
+        user_id,
+        request["platform"],
+    ):
+        await query.answer(
+            "لا تملك صلاحية هذه المنصة.",
+            show_alert=True,
+        )
         return
 
     if request["status"] != "PENDING":
-        await query.answer("تمت معالجة الطلب بالفعل.", show_alert=True)
+        await query.answer(
+            "تمت معالجة الطلب بالفعل.",
+            show_alert=True,
+        )
         return
 
     if not db.transition_request(
@@ -804,12 +1202,22 @@ async def approve_callback(update, context):
         user_id,
         "approved",
     ):
-        await query.answer("تمت معالجة الطلب بالفعل.", show_alert=True)
+        await query.answer(
+            "تمت معالجة الطلب بالفعل.",
+            show_alert=True,
+        )
         return
 
-    group = db.get_group(request["platform"])
+    group = db.get_group(
+        request["platform"]
+    )
+
     if not group:
-        db.set_request_status(request_id, "PENDING")
+        db.set_request_status(
+            request_id,
+            "PENDING",
+        )
+
         db.log_event(
             "ERROR",
             "group_not_configured",
@@ -817,6 +1225,7 @@ async def approve_callback(update, context):
             request_id,
             request["platform"],
         )
+
         await query.answer(
             "لم يتم تعيين كروب لهذه المنصة.",
             show_alert=True,
@@ -828,6 +1237,7 @@ async def approve_callback(update, context):
             group["chat_id"],
             format_request(request),
         )
+
         db.set_group_message(
             request_id,
             group["chat_id"],
@@ -840,6 +1250,7 @@ async def approve_callback(update, context):
                 message.message_id,
                 disable_notification=True,
             )
+
         except TelegramError as exc:
             db.log_event(
                 "ERROR",
@@ -848,15 +1259,35 @@ async def approve_callback(update, context):
                 request_id,
                 str(exc),
             )
-            await query.edit_message_reply_markup(reply_markup=None)
+
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+
             await query.message.reply_text(
                 "تم إرسال الشدة، لكن تعذر تثبيتها. راجع صلاحيات البوت في الكروب."
             )
+
             await context.bot.send_message(
                 request["user_id"],
                 "تمت الموافقة على شدتك وتم نزولها.",
             )
             return
+
+        # إرسال نسخة إلى الكروب العام.
+        common_message = await send_to_common_group(
+            context.bot,
+            request,
+        )
+
+        if common_message:
+            db.log_event(
+                "INFO",
+                "sent_to_common_group",
+                user_id,
+                request_id,
+                str(common_message.message_id),
+            )
 
         try:
             await lock_group(
@@ -864,6 +1295,7 @@ async def approve_callback(update, context):
                 request["platform"],
                 group["chat_id"],
             )
+
         except (TelegramError, RuntimeError) as exc:
             db.log_event(
                 "ERROR",
@@ -872,27 +1304,40 @@ async def approve_callback(update, context):
                 request_id,
                 str(exc),
             )
+
             await query.message.reply_text(
                 "تم نزول الشدة، لكن تعذر قفل الكتابة. تأكد أن البوت Administrator ولديه صلاحية تقييد الأعضاء."
             )
+
             await context.bot.send_message(
                 request["user_id"],
                 "تمت الموافقة على شدتك وتم نزولها.",
             )
-            await query.edit_message_reply_markup(reply_markup=None)
+
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
             return
 
         await query.edit_message_reply_markup(
             reply_markup=finish_keyboard(request_id)
         )
-        await query.answer("تم قبول الشد.")
+
+        await query.answer(
+            "تم قبول الشد."
+        )
+
         await context.bot.send_message(
             request["user_id"],
             "تمت الموافقة على شدتك وتم نزولها.",
         )
 
     except TelegramError as exc:
-        db.set_request_status(request_id, "PENDING")
+        db.set_request_status(
+            request_id,
+            "PENDING",
+        )
+
         db.log_event(
             "ERROR",
             "send_group_failed",
@@ -900,6 +1345,7 @@ async def approve_callback(update, context):
             request_id,
             str(exc),
         )
+
         await query.answer(
             "تعذر إرسال الشدة إلى الكروب. لم يتم إكمال العملية.",
             show_alert=True,
@@ -911,26 +1357,53 @@ async def reject_callback(update, context):
     user_id = query.from_user.id
 
     try:
-        request_id = int(query.data.split(":", 1)[1])
+        request_id = int(
+            query.data.split(":", 1)[1]
+        )
     except (ValueError, IndexError):
-        await query.answer("رقم الطلب غير صحيح.", show_alert=True)
+        await query.answer(
+            "رقم الطلب غير صحيح.",
+            show_alert=True,
+        )
         return
 
     request = db.get_request(request_id)
+
     if not request:
-        await query.answer("الطلب غير موجود.", show_alert=True)
+        await query.answer(
+            "الطلب غير موجود.",
+            show_alert=True,
+        )
         return
 
-    if not db.get_admin(user_id, request["platform"]):
-        await query.answer("لا تملك صلاحية هذه المنصة.", show_alert=True)
+    if not db.get_admin(
+        user_id,
+        request["platform"],
+    ):
+        await query.answer(
+            "لا تملك صلاحية هذه المنصة.",
+            show_alert=True,
+        )
         return
 
-    if not db.reject_request(request_id, user_id):
-        await query.answer("تمت معالجة الطلب بالفعل.", show_alert=True)
+    if not db.reject_request(
+        request_id,
+        user_id,
+    ):
+        await query.answer(
+            "تمت معالجة الطلب بالفعل.",
+            show_alert=True,
+        )
         return
 
-    await query.edit_message_reply_markup(reply_markup=None)
-    await query.answer("تم رفض الشد.")
+    await query.edit_message_reply_markup(
+        reply_markup=None
+    )
+
+    await query.answer(
+        "تم رفض الشد."
+    )
+
     await context.bot.send_message(
         request["user_id"],
         "تم رفض الشدة.",
@@ -942,27 +1415,51 @@ async def finish_callback(update, context):
     user_id = query.from_user.id
 
     try:
-        request_id = int(query.data.split(":", 1)[1])
+        request_id = int(
+            query.data.split(":", 1)[1]
+        )
     except (ValueError, IndexError):
-        await query.answer("رقم الطلب غير صحيح.", show_alert=True)
+        await query.answer(
+            "رقم الطلب غير صحيح.",
+            show_alert=True,
+        )
         return
 
     request = db.get_request(request_id)
+
     if not request:
-        await query.answer("الطلب غير موجود.", show_alert=True)
+        await query.answer(
+            "الطلب غير موجود.",
+            show_alert=True,
+        )
         return
 
-    if not db.get_admin(user_id, request["platform"]):
-        await query.answer("لا تملك صلاحية هذه المنصة.", show_alert=True)
+    if not db.get_admin(
+        user_id,
+        request["platform"],
+    ):
+        await query.answer(
+            "لا تملك صلاحية هذه المنصة.",
+            show_alert=True,
+        )
         return
 
     if request["status"] != "APPROVED":
-        await query.answer("هذا الطلب لا يمكن إنهاؤه.", show_alert=True)
+        await query.answer(
+            "هذا الطلب لا يمكن إنهاؤه.",
+            show_alert=True,
+        )
         return
 
-    group = db.get_group(request["platform"])
+    group = db.get_group(
+        request["platform"]
+    )
+
     if not group:
-        await query.answer("كروب المنصة غير مضبوط.", show_alert=True)
+        await query.answer(
+            "كروب المنصة غير مضبوط.",
+            show_alert=True,
+        )
         return
 
     try:
@@ -971,6 +1468,7 @@ async def finish_callback(update, context):
             request["platform"],
             group["chat_id"],
         )
+
     except (TelegramError, RuntimeError) as exc:
         db.log_event(
             "ERROR",
@@ -979,6 +1477,7 @@ async def finish_callback(update, context):
             request_id,
             str(exc),
         )
+
         await query.answer(
             "تعذر فتح الكتابة. تأكد من صلاحيات البوت.",
             show_alert=True,
@@ -998,8 +1497,14 @@ async def finish_callback(update, context):
         )
         return
 
-    await query.edit_message_reply_markup(reply_markup=None)
-    await query.answer("انتهى الشد.")
+    await query.edit_message_reply_markup(
+        reply_markup=None
+    )
+
+    await query.answer(
+        "انتهى الشد."
+    )
+
     await context.bot.send_message(
         request["user_id"],
         "انتهى الشد.",
@@ -1010,8 +1515,12 @@ async def finish_callback(update, context):
             await context.bot.edit_message_text(
                 chat_id=request["group_chat_id"],
                 message_id=request["group_message_id"],
-                text=format_request(request) + "\n\nالحالة: انتهى الشد.",
+                text=(
+                    format_request(request)
+                    + "\n\nالحالة: انتهى الشد."
+                ),
             )
+
         except TelegramError as exc:
             db.log_event(
                 "ERROR",
@@ -1031,8 +1540,11 @@ def is_founder(user_id):
 
 async def start(update, context):
     user_id = update.effective_user.id
+
     if not db.get_user(user_id):
-        await update.message.reply_text("لا تملك صلاحية استخدام البوت.")
+        await update.message.reply_text(
+            "لا تملك صلاحية استخدام البوت."
+        )
         return
 
     if is_founder(user_id):
@@ -1050,11 +1562,16 @@ async def start(update, context):
 
 async def founder_callback(update, context):
     query = update.callback_query
+
     if not is_founder(query.from_user.id):
-        await query.answer("لا تملك صلاحية الإدارة.", show_alert=True)
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
         return
 
     await query.answer()
+
     key = query.data
 
     if key == "founder:home":
@@ -1062,46 +1579,60 @@ async def founder_callback(update, context):
             "لوحة الإدارة",
             reply_markup=founder_keyboard(),
         )
+
     elif key == "founder:users":
         await query.edit_message_text(
             "إدارة الأعضاء",
             reply_markup=founder_users_keyboard(),
         )
+
     elif key == "founder:admins":
         await query.edit_message_text(
             "إدارة المشرفين",
             reply_markup=founder_admins_keyboard(),
         )
+
     elif key == "founder:groups":
         await query.edit_message_text(
             "إدارة الكروبات",
             reply_markup=founder_groups_keyboard(),
         )
+
     elif key == "founder:platforms":
         await query.edit_message_text(
             "إدارة المنصات",
             reply_markup=founder_platforms_keyboard(),
         )
+
     elif key == "founder:requests":
         rows = db.list_requests()
+
         text = "آخر الطلبات:\n\n" + "\n".join(
-            f"#{r['id']} | {r['platform']} | {r['status']} | {r['created_at']}"
+            (
+                f"#{r['id']} | {r['platform']} | "
+                f"{r['status']} | {r['created_at']}"
+            )
             for r in rows
         )
+
         await query.edit_message_text(
             text or "لا توجد طلبات.",
             reply_markup=founder_keyboard(),
         )
+
     elif key == "founder:stats":
         rows = db.stats()
+
         text = "الإحصائيات:\n\n" + "\n".join(
             f"{r['platform']} - {r['status']}: {r['n']}"
             for r in rows
         )
+
         await query.edit_message_text(
             text or "لا توجد بيانات.",
             reply_markup=founder_keyboard(),
         )
+
     elif key == "founder:settings":
         await query.edit_message_text(
             "الإعدادات الحالية محفوظة في Environment Variables وقاعدة البيانات.",
@@ -1111,18 +1642,33 @@ async def founder_callback(update, context):
 
 async def founder_action_callback(update, context):
     query = update.callback_query
+
     if not is_founder(query.from_user.id):
-        await query.answer("لا تملك صلاحية الإدارة.", show_alert=True)
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
         return
 
     await query.answer()
+
     action = query.data.split(":")[1]
 
     prompts = {
-        "add_user": "أرسل ID العضو ثم الاسم بهذا الشكل:\n123456789 | الاسم",
-        "remove_user": "أرسل ID العضو المراد حذفه.",
-        "add_admin": "أرسل ID المشرف ثم المنصة بهذا الشكل:\n123456789 | telegram",
-        "remove_admin": "أرسل ID المشرف المراد حذفه.",
+        "add_user": (
+            "أرسل ID العضو ثم الاسم بهذا الشكل:\n"
+            "123456789 | الاسم"
+        ),
+        "remove_user": (
+            "أرسل ID العضو المراد حذفه."
+        ),
+        "add_admin": (
+            "أرسل ID المشرف ثم المنصة بهذا الشكل:\n"
+            "123456789 | telegram"
+        ),
+        "remove_admin": (
+            "أرسل ID المشرف المراد حذفه."
+        ),
     }
 
     if action in prompts:
@@ -1131,15 +1677,20 @@ async def founder_action_callback(update, context):
             f"FOUNDER_{action.upper()}",
             {},
         )
-        await query.edit_message_text(prompts[action])
+
+        await query.edit_message_text(
+            prompts[action]
+        )
         return
 
     if action == "list_users":
         rows = db.list_users()
+
         text = "الأعضاء:\n\n" + "\n".join(
             f"{r['user_id']} | {r['full_name']} | {r['role']}"
             for r in rows
         )
+
         await query.edit_message_text(
             text or "لا يوجد أعضاء.",
             reply_markup=founder_users_keyboard(),
@@ -1148,52 +1699,119 @@ async def founder_action_callback(update, context):
 
     if action == "list_admins":
         rows = db.list_admins()
+
         text = "المشرفون:\n\n" + "\n".join(
-            f"{r['user_id']} | {r['full_name']} | {r['platform']}"
+            (
+                f"{r['user_id']} | "
+                f"{r['full_name']} | "
+                f"{r['platform']}"
+            )
             for r in rows
         )
+
         await query.edit_message_text(
             text or "لا يوجد مشرفون.",
             reply_markup=founder_admins_keyboard(),
         )
 
 
-async def set_group_callback(update, context):
+async def list_groups_callback(update, context):
     query = update.callback_query
+
     if not is_founder(query.from_user.id):
-        await query.answer("لا تملك صلاحية الإدارة.", show_alert=True)
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
         return
 
     await query.answer()
+
+    lines = ["الكروبات الحالية:", ""]
+
+    labels = {
+        "telegram": "Telegram",
+        "instagram": "Instagram",
+        "tiktok": "TikTok",
+        "common": "الكروب العام",
+    }
+
+    for platform in (
+        "telegram",
+        "instagram",
+        "tiktok",
+        "common",
+    ):
+        group = db.get_group(platform)
+
+        lines.append(
+            f"{labels[platform]}: "
+            f"{group['chat_id'] if group else 'غير مضبوط'}"
+        )
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=founder_groups_keyboard(),
+    )
+
+
+async def set_group_callback(update, context):
+    query = update.callback_query
+
+    if not is_founder(query.from_user.id):
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
     platform = query.data.split(":")[2]
+
     db.set_session(
         query.from_user.id,
         f"FOUNDER_SET_GROUP_{platform.upper()}",
         {},
     )
+
+    if platform == COMMON_PLATFORM:
+        label = "الكروب العام"
+    else:
+        label = f"كروب {platform}"
+
     await query.edit_message_text(
-        f"أرسل Chat ID لكروب {platform}."
+        f"أرسل Chat ID لـ {label}."
     )
 
 
 async def founder_platform_callback(update, context):
     query = update.callback_query
+
     if not is_founder(query.from_user.id):
-        await query.answer("لا تملك صلاحية الإدارة.", show_alert=True)
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
         return
 
     await query.answer()
+
     platform = query.data.split(":")[2]
+
     group = db.get_group(platform)
+
     admins = [
-        admin for admin in db.list_admins()
+        admin
+        for admin in db.list_admins()
         if admin["platform"] == platform
     ]
 
     await query.edit_message_text(
         f"المنصة: {platform}\n"
         f"الحالة: مفعلة\n"
-        f"Chat ID: {group['chat_id'] if group else 'غير مضبوط'}\n"
+        f"Chat ID: "
+        f"{group['chat_id'] if group else 'غير مضبوط'}\n"
         f"عدد المشرفين: {len(admins)}",
         reply_markup=founder_platforms_keyboard(),
     )
@@ -1204,10 +1822,12 @@ async def founder_text_router(update, context):
         return False
 
     user_id = update.effective_user.id
+
     if not is_founder(user_id):
         return False
 
     session = db.get_session(user_id)
+
     if not session or not session[0].startswith("FOUNDER_"):
         return False
 
@@ -1216,60 +1836,109 @@ async def founder_text_router(update, context):
 
     try:
         if state == "FOUNDER_ADD_USER":
-            uid_s, name = [x.strip() for x in text.split("|", 1)]
+            uid_s, name = [
+                x.strip()
+                for x in text.split("|", 1)
+            ]
+
             uid = int(uid_s)
-            db.add_user(uid, None, name, "member")
+
+            db.add_user(
+                uid,
+                None,
+                name,
+                "member",
+            )
+
             db.clear_session(user_id)
+
             await update.message.reply_text(
                 "تمت إضافة العضو.",
                 reply_markup=founder_keyboard(),
             )
+
             return True
 
         if state == "FOUNDER_REMOVE_USER":
             db.remove_user(int(text))
             db.clear_session(user_id)
+
             await update.message.reply_text(
                 "تم حذف العضو.",
                 reply_markup=founder_keyboard(),
             )
+
             return True
 
         if state == "FOUNDER_ADD_ADMIN":
-            uid_s, platform = [x.strip().lower() for x in text.split("|", 1)]
+            uid_s, platform = [
+                x.strip().lower()
+                for x in text.split("|", 1)
+            ]
+
             uid = int(uid_s)
-            if platform not in ("telegram", "instagram", "tiktok"):
+
+            if platform not in PLATFORMS:
                 raise ValueError
 
             if not db.get_user(uid):
-                db.add_user(uid, None, str(uid), "member")
+                db.add_user(
+                    uid,
+                    None,
+                    str(uid),
+                    "member",
+                )
 
-            db.add_admin(uid, platform)
+            db.add_admin(
+                uid,
+                platform,
+            )
+
             db.clear_session(user_id)
+
             await update.message.reply_text(
                 "تمت إضافة المشرف وربطه بالمنصة.",
                 reply_markup=founder_keyboard(),
             )
+
             return True
 
         if state == "FOUNDER_REMOVE_ADMIN":
             db.remove_admin(int(text))
             db.clear_session(user_id)
+
             await update.message.reply_text(
                 "تم حذف المشرف.",
                 reply_markup=founder_keyboard(),
             )
+
             return True
 
         if state.startswith("FOUNDER_SET_GROUP_"):
             platform = state.rsplit("_", 1)[1].lower()
+
             chat_id = int(text)
-            db.set_group(platform, chat_id)
+
+            if platform not in (
+                "telegram",
+                "instagram",
+                "tiktok",
+                "common",
+            ):
+                raise ValueError
+
+            db.set_group(
+                platform,
+                chat_id,
+            )
+
             db.clear_session(user_id)
+
             await update.message.reply_text(
                 "تم حفظ Chat ID.",
                 reply_markup=founder_keyboard(),
             )
+
             return True
 
     except (ValueError, IndexError):
@@ -1287,12 +1956,17 @@ async def founder_text_router(update, context):
 async def route_text(update, context):
     if await founder_text_router(update, context):
         return
+
     await text_router(update, context)
 
 
 async def error_handler(update, context):
     error = context.error
-    log.exception("Unhandled Telegram error", exc_info=error)
+
+    log.exception(
+        "Unhandled Telegram error",
+        exc_info=error,
+    )
 
     user_id = getattr(
         getattr(update, "effective_user", None),
@@ -1319,7 +1993,13 @@ async def error_handler(update, context):
 
 
 def build_app():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
     app.bot_data["db"] = db
     app.bot_data["founder_id"] = FOUNDER_ID
 
@@ -1331,7 +2011,12 @@ def build_app():
             "founder",
         )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
 
     app.add_handler(
         CallbackQueryHandler(
@@ -1339,24 +2024,28 @@ def build_app():
             pattern=r"^platform:(telegram|instagram|tiktok)$",
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             cancel_callback,
             pattern=r"^cancel$",
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             approve_callback,
             pattern=r"^approve:\d+$",
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             reject_callback,
             pattern=r"^reject:\d+$",
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             finish_callback,
@@ -1370,18 +2059,34 @@ def build_app():
             pattern=r"^founder:",
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             founder_action_callback,
-            pattern=r"^f:(add_user|remove_user|list_users|add_admin|remove_admin|list_admins)$",
+            pattern=(
+                r"^f:(add_user|remove_user|list_users|"
+                r"add_admin|remove_admin|list_admins)$"
+            ),
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             set_group_callback,
-            pattern=r"^f:set_group:(telegram|instagram|tiktok)$",
+            pattern=(
+                r"^f:set_group:"
+                r"(telegram|instagram|tiktok|common)$"
+            ),
         )
     )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            list_groups_callback,
+            pattern=r"^f:list_groups$",
+        )
+    )
+
     app.add_handler(
         CallbackQueryHandler(
             founder_platform_callback,
@@ -1396,7 +2101,10 @@ def build_app():
         )
     )
 
-    app.add_error_handler(error_handler)
+    app.add_error_handler(
+        error_handler
+    )
+
     return app
 
 

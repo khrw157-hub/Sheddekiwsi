@@ -314,6 +314,19 @@ class Database:
                 ),
             )
 
+    def get_common_lock(self):
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT previous_permissions FROM groups_config WHERE platform='common'"
+            ).fetchone()
+            return row["previous_permissions"] if row else None
+
+    def set_common_lock(self, permissions_json):
+        self.set_previous_permissions("common", permissions_json)
+
+    def clear_common_lock(self):
+        self.clear_previous_permissions("common")
+
     def clear_previous_permissions(self, platform):
         with self.conn() as con:
             con.execute(
@@ -683,7 +696,7 @@ def founder_platforms_keyboard():
     ])
 
 # ============================================================
-# Utilities and group permissions
+# Utilities
 # ============================================================
 
 def row_data(row):
@@ -692,23 +705,19 @@ def row_data(row):
 
 def format_request(request):
     data = row_data(request)
-
-    lines = [
-        f"{request['platform'].upper()} SHD",
-        "",
-    ]
-
+    lines = [f"{request['platform'].upper()} SHD", ""]
     for key, value in data.items():
         lines.append(f"{key}:")
         lines.append(str(value))
         lines.append("")
-
     lines.append(f"رقم الطلب: {request['id']}")
-
     return "\n".join(lines).strip()
 
+# ============================================================
+# Common group permissions
+# ============================================================
 
-def permissions_to_json(permissions):
+def common_permissions_to_json(permissions):
     values = {
         "can_send_messages": permissions.can_send_messages,
         "can_send_audios": permissions.can_send_audios,
@@ -720,31 +729,19 @@ def permissions_to_json(permissions):
         "can_send_polls": permissions.can_send_polls,
         "can_send_other_messages": permissions.can_send_other_messages,
         "can_add_web_page_previews": permissions.can_add_web_page_previews,
-        "can_change_info": permissions.can_change_info,
-        "can_invite_users": permissions.can_invite_users,
-        "can_pin_messages": permissions.can_pin_messages,
-        "can_manage_topics": permissions.can_manage_topics,
     }
-
     return json.dumps(values, ensure_ascii=False)
 
 
-def permissions_from_json(raw):
-    values = json.loads(raw)
-    return ChatPermissions(**values)
+def common_permissions_from_json(raw):
+    return ChatPermissions(**json.loads(raw))
 
 
-async def lock_group(bot, platform, chat_id):
+async def lock_common_group(bot, chat_id):
     chat = await bot.get_chat(chat_id)
-
     if not chat.permissions:
-        raise RuntimeError("تعذر قراءة صلاحيات الكروب.")
-
-    db.set_previous_permissions(
-        platform,
-        permissions_to_json(chat.permissions),
-    )
-
+        raise RuntimeError("تعذر قراءة صلاحيات الكروب العام.")
+    db.set_common_lock(common_permissions_to_json(chat.permissions))
     locked = ChatPermissions(
         can_send_messages=False,
         can_send_audios=False,
@@ -756,12 +753,7 @@ async def lock_group(bot, platform, chat_id):
         can_send_polls=False,
         can_send_other_messages=False,
         can_add_web_page_previews=False,
-        can_change_info=False,
-        can_invite_users=False,
-        can_pin_messages=False,
-        can_manage_topics=False,
     )
-
     await bot.set_chat_permissions(
         chat_id,
         locked,
@@ -769,15 +761,12 @@ async def lock_group(bot, platform, chat_id):
     )
 
 
-async def unlock_group(bot, platform, chat_id):
-    group = db.get_group(platform)
-
-    if group and group["previous_permissions"]:
-        permissions = permissions_from_json(
-            group["previous_permissions"]
-        )
-    else:
-        permissions = ChatPermissions(
+async def unlock_common_group(bot, chat_id):
+    raw = db.get_common_lock()
+    permissions = (
+        common_permissions_from_json(raw)
+        if raw
+        else ChatPermissions(
             can_send_messages=True,
             can_send_audios=True,
             can_send_documents=True,
@@ -789,54 +778,14 @@ async def unlock_group(bot, platform, chat_id):
             can_send_other_messages=True,
             can_add_web_page_previews=True,
         )
-
+    )
     await bot.set_chat_permissions(
         chat_id,
         permissions,
         use_independent_chat_permissions=True,
     )
+    db.clear_common_lock()
 
-    db.clear_previous_permissions(platform)
-
-
-async def send_to_common_group(bot, request):
-    group = db.get_group(COMMON_PLATFORM)
-
-    if not group:
-        return None
-
-    try:
-        message = await bot.send_message(
-            group["chat_id"],
-            format_request(request),
-        )
-
-        try:
-            await bot.pin_chat_message(
-                group["chat_id"],
-                message.message_id,
-                disable_notification=True,
-            )
-        except TelegramError as exc:
-            db.log_event(
-                "ERROR",
-                "common_group_pin_failed",
-                None,
-                request["id"],
-                str(exc),
-            )
-
-        return message
-
-    except TelegramError as exc:
-        db.log_event(
-            "ERROR",
-            "common_group_send_failed",
-            None,
-            request["id"],
-            str(exc),
-        )
-        return None
 
 # ============================================================
 # Platform workflows
@@ -1244,6 +1193,25 @@ async def approve_callback(update, context):
             message.message_id,
         )
 
+        # أرسل نسخة إلى الكروب العام، ثم اقفل الكروب العام فقط.
+        common = db.get_group("common")
+        if common:
+            try:
+                await context.bot.send_message(
+                    common["chat_id"],
+                    format_request(request),
+                )
+                await lock_common_group(context.bot, common["chat_id"])
+            except (TelegramError, RuntimeError) as exc:
+                db.log_event(
+                    "ERROR",
+                    "common_group_failed",
+                    user_id,
+                    request_id,
+                    str(exc),
+                )
+                # فشل الكروب العام لا يلغي نزول الشدة في كروب المنصة.
+
         try:
             await context.bot.pin_chat_message(
                 group["chat_id"],
@@ -1290,7 +1258,7 @@ async def approve_callback(update, context):
             )
 
         try:
-            await lock_group(
+            await lock_common_group(
                 context.bot,
                 request["platform"],
                 group["chat_id"],
@@ -1462,27 +1430,23 @@ async def finish_callback(update, context):
         )
         return
 
-    try:
-        await unlock_group(
-            context.bot,
-            request["platform"],
-            group["chat_id"],
-        )
-
-    except (TelegramError, RuntimeError) as exc:
-        db.log_event(
-            "ERROR",
-            "unlock_group_failed",
-            user_id,
-            request_id,
-            str(exc),
-        )
-
-        await query.answer(
-            "تعذر فتح الكتابة. تأكد من صلاحيات البوت.",
-            show_alert=True,
-        )
-        return
+    common = db.get_group("common")
+    if common:
+        try:
+            await unlock_common_group(context.bot, common["chat_id"])
+        except (TelegramError, RuntimeError) as exc:
+            db.log_event(
+                "ERROR",
+                "common_group_unlock_failed",
+                user_id,
+                request_id,
+                str(exc),
+            )
+            await query.answer(
+                "تعذر فتح الكروب العام. تأكد من صلاحيات البوت.",
+                show_alert=True,
+            )
+            return
 
     if not db.transition_request(
         request_id,
@@ -1539,6 +1503,9 @@ def is_founder(user_id):
 
 
 async def start(update, context):
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     user_id = update.effective_user.id
 
     if not db.get_user(user_id):
@@ -2096,7 +2063,7 @@ def build_app():
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             route_text,
         )
     )

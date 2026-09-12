@@ -8,6 +8,9 @@ import os
 import json
 import logging
 import sqlite3
+import base64
+import gzip
+from io import BytesIO
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -53,6 +56,57 @@ if not FOUNDER_ID:
 
 PLATFORMS = ("telegram", "instagram", "tiktok")
 COMMON_PLATFORM = "common"
+
+TEAM_LINK_URL = "https://t.me/team_dark8"
+
+# ============================================================
+# Application feature configuration
+# ============================================================
+
+APPLY_STATE = "APPLYING"
+
+# مفاتيح ونصوص أسئلة التقديم. القسم (department) له معالجة خاصة بأزرار
+# وليس نصًا حرًا. المالك يستطيع تغيير ترتيب هذه الأسئلة فقط (وليس حذفها).
+APPLY_QUESTIONS = {
+    "name": "ما اسمك؟",
+    "fields": "ما هي مجالاتك التي تخصصت بها؟",
+    "department": "ما هو قسمك؟",
+    "prev_teams": "ما هي التيمات التي سبق وأن دخلت بها؟",
+    "self_eval": "هل ترى نفسك تستحق التقديم؟",
+}
+
+DEPARTMENT_OPTIONS = {
+    "instagram": "انستقرام",
+    "telegram": "تيليجرام",
+    "both": "كلاهما",
+}
+
+# ============================================================
+# Config backup/restore feature (نسخ احتياطي لإعدادات البوت)
+# ============================================================
+
+CONFIG_BACKUP_PREFIX = "SHDCFG1:"
+# إذا كان طول الكود أطول من هذا الحد يُرسل كملف .txt بدل رسالة نصية.
+CONFIG_BACKUP_INLINE_LIMIT = 3500
+
+
+def encode_config_blob(data):
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    compressed = gzip.compress(raw)
+    encoded = base64.urlsafe_b64encode(compressed).decode("ascii")
+    return CONFIG_BACKUP_PREFIX + encoded
+
+
+def decode_config_blob(text):
+    cleaned = "".join(text.split())
+
+    if not cleaned.startswith(CONFIG_BACKUP_PREFIX):
+        raise ValueError("invalid backup code prefix")
+
+    encoded = cleaned[len(CONFIG_BACKUP_PREFIX):]
+    compressed = base64.urlsafe_b64decode(encoded.encode("ascii"))
+    raw = gzip.decompress(compressed)
+    return json.loads(raw.decode("utf-8"))
 
 # ============================================================
 # Database
@@ -145,6 +199,25 @@ class Database:
                 request_id INTEGER,
                 details TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                department TEXT,
+                answers_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                decided_by INTEGER,
+                decided_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             """)
 
@@ -516,6 +589,224 @@ class Database:
                 (user_id,),
             )
 
+    # -------------------- Settings (key/value) --------------------
+
+    def get_setting(self, key, default=None):
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT value FROM settings WHERE key=?",
+                (key,),
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        with self.conn() as con:
+            con.execute(
+                """INSERT INTO settings(key, value)
+                   VALUES(?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (key, value),
+            )
+
+    # -------------------- Applications (التقديم على التيم) --------------------
+
+    def create_application(self, user_id, username, full_name, department, answers):
+        created = now_iso()
+
+        with self.conn() as con:
+            cur = con.execute(
+                """INSERT INTO applications(
+                    user_id,username,full_name,department,answers_json,
+                    status,created_at,updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    user_id,
+                    username,
+                    full_name,
+                    department,
+                    json.dumps(answers, ensure_ascii=False),
+                    "PENDING",
+                    created,
+                    created,
+                ),
+            )
+            return cur.lastrowid
+
+    def get_application(self, app_id):
+        with self.conn() as con:
+            return con.execute(
+                "SELECT * FROM applications WHERE id=?",
+                (app_id,),
+            ).fetchone()
+
+    def get_pending_application(self, user_id):
+        with self.conn() as con:
+            return con.execute(
+                """SELECT * FROM applications
+                   WHERE user_id=? AND status='PENDING'
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                (user_id,),
+            ).fetchone()
+
+    def set_application_status(self, app_id, status, decided_by):
+        with self.conn() as con:
+            con.execute(
+                """UPDATE applications
+                   SET status=?, decided_by=?, decided_at=?, updated_at=?
+                   WHERE id=?""",
+                (
+                    status,
+                    decided_by,
+                    now_iso(),
+                    now_iso(),
+                    app_id,
+                ),
+            )
+
+    def list_applications(self, limit=50):
+        with self.conn() as con:
+            return con.execute(
+                """SELECT * FROM applications
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+    # -------------------- Config backup/restore --------------------
+    # يشمل النسخ الاحتياطي: الأعضاء، المشرفين، الكروبات، المنصات،
+    # وإعدادات ميزة التقديم (رسالة الترحيب وترتيب الأسئلة).
+    # لا يشمل: الطلبات (requests)، طلبات التقديم (applications)،
+    # الجلسات المؤقتة (sessions)، أو السجلات (logs).
+
+    def export_config(self):
+        with self.conn() as con:
+            users = [
+                dict(r) for r in con.execute(
+                    """SELECT user_id,username,full_name,role
+                       FROM users WHERE active=1"""
+                )
+            ]
+            admins = [
+                dict(r) for r in con.execute(
+                    "SELECT user_id,platform FROM admins WHERE active=1"
+                )
+            ]
+            groups = [
+                dict(r) for r in con.execute(
+                    "SELECT platform,chat_id FROM groups_config"
+                )
+            ]
+            platforms = [
+                dict(r) for r in con.execute(
+                    "SELECT name,enabled FROM platforms"
+                )
+            ]
+            settings = [
+                dict(r) for r in con.execute(
+                    "SELECT key,value FROM settings"
+                )
+            ]
+
+        return {
+            "version": 1,
+            "exported_at": now_iso(),
+            "users": users,
+            "admins": admins,
+            "groups": groups,
+            "platforms": platforms,
+            "settings": settings,
+        }
+
+    def import_config(self, data):
+        with self.conn() as con:
+            con.execute("BEGIN IMMEDIATE")
+
+            for u in data.get("users", []):
+                if "user_id" not in u:
+                    continue
+                con.execute(
+                    """INSERT INTO users(
+                        user_id,username,full_name,role,active,created_at
+                    )
+                    VALUES(?,?,?,?,1,?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username=excluded.username,
+                        full_name=excluded.full_name,
+                        role=excluded.role,
+                        active=1""",
+                    (
+                        u["user_id"],
+                        u.get("username"),
+                        u.get("full_name") or str(u["user_id"]),
+                        u.get("role", "member"),
+                        now_iso(),
+                    ),
+                )
+
+            for a in data.get("admins", []):
+                if "user_id" not in a or "platform" not in a:
+                    continue
+                con.execute(
+                    """INSERT INTO admins(
+                        user_id,platform,active,created_at
+                    )
+                    VALUES(?,?,1,?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        platform=excluded.platform,
+                        active=1""",
+                    (
+                        a["user_id"],
+                        a["platform"],
+                        now_iso(),
+                    ),
+                )
+
+            for g in data.get("groups", []):
+                if "platform" not in g or "chat_id" not in g:
+                    continue
+                con.execute(
+                    """INSERT INTO groups_config(
+                        platform,chat_id,previous_permissions
+                    )
+                    VALUES(?,?,NULL)
+                    ON CONFLICT(platform) DO UPDATE SET
+                        chat_id=excluded.chat_id""",
+                    (
+                        g["platform"],
+                        g["chat_id"],
+                    ),
+                )
+
+            for p in data.get("platforms", []):
+                if "name" not in p:
+                    continue
+                con.execute(
+                    """INSERT INTO platforms(name, enabled)
+                       VALUES(?, ?)
+                       ON CONFLICT(name) DO UPDATE SET
+                           enabled=excluded.enabled""",
+                    (
+                        p["name"],
+                        p.get("enabled", 1),
+                    ),
+                )
+
+            for s in data.get("settings", []):
+                if "key" not in s:
+                    continue
+                con.execute(
+                    """INSERT INTO settings(key, value)
+                       VALUES(?, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value=excluded.value""",
+                    (
+                        s["key"],
+                        s.get("value"),
+                    ),
+                )
+
 
 db = Database(DB_PATH)
 
@@ -588,6 +879,14 @@ def founder_keyboard():
         [InlineKeyboardButton(
             "إدارة الكروبات",
             callback_data="founder:groups",
+        )],
+        [InlineKeyboardButton(
+            "إعدادات التقديم",
+            callback_data="founder:apply",
+        )],
+        [InlineKeyboardButton(
+            "نسخ احتياطي للإعدادات",
+            callback_data="founder:backup",
         )],
         [InlineKeyboardButton(
             "الطلبات",
@@ -695,6 +994,118 @@ def founder_platforms_keyboard():
         )],
     ])
 
+
+def founder_apply_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "تعيين رسالة الترحيب",
+            callback_data="f:apply_set_welcome",
+        )],
+        [InlineKeyboardButton(
+            "ترتيب أسئلة التقديم",
+            callback_data="f:apply_order",
+        )],
+        [InlineKeyboardButton(
+            "معاينة رسالة الترحيب",
+            callback_data="f:apply_preview",
+        )],
+        [InlineKeyboardButton(
+            "رجوع",
+            callback_data="founder:home",
+        )],
+    ])
+
+
+def founder_backup_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "تصدير الإعدادات (نسخ احتياطي)",
+            callback_data="f:backup_export",
+        )],
+        [InlineKeyboardButton(
+            "استيراد الإعدادات (استرجاع)",
+            callback_data="f:backup_import",
+        )],
+        [InlineKeyboardButton(
+            "رجوع",
+            callback_data="founder:home",
+        )],
+    ])
+
+
+def apply_order_keyboard():
+    order = apply_question_order()
+    rows = []
+
+    for i, key in enumerate(order):
+        label = APPLY_QUESTIONS[key]
+        rows.append([InlineKeyboardButton(
+            f"{i + 1}. {label}",
+            callback_data="noop",
+        )])
+
+        arrows = []
+        if i > 0:
+            arrows.append(InlineKeyboardButton(
+                "أعلى",
+                callback_data=f"f:apply_order:up:{key}",
+            ))
+        if i < len(order) - 1:
+            arrows.append(InlineKeyboardButton(
+                "أسفل",
+                callback_data=f"f:apply_order:down:{key}",
+            ))
+        if arrows:
+            rows.append(arrows)
+
+    rows.append([InlineKeyboardButton(
+        "رجوع",
+        callback_data="founder:apply",
+    )])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def welcome_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "رابط التيم",
+            url=TEAM_LINK_URL,
+        )],
+        [InlineKeyboardButton(
+            "التقديم",
+            callback_data="apply:start",
+        )],
+    ])
+
+
+def department_keyboard():
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"apply_dept:{key}")]
+        for key, label in DEPARTMENT_OPTIONS.items()
+    ]
+    rows.append([InlineKeyboardButton("إلغاء", callback_data="apply_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def cancel_apply_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("إلغاء", callback_data="apply_cancel")]
+    ])
+
+
+def application_keyboard(app_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "قبول",
+            callback_data=f"app_approve:{app_id}",
+        ),
+        InlineKeyboardButton(
+            "رفض",
+            callback_data=f"app_reject:{app_id}",
+        ),
+    ]])
+
 # ============================================================
 # Utilities
 # ============================================================
@@ -711,6 +1122,35 @@ def format_request(request):
         lines.append(str(value))
         lines.append("")
     lines.append(f"رقم الطلب: {request['id']}")
+    return "\n".join(lines).strip()
+
+
+def format_application(app_row):
+    answers = json.loads(app_row["answers_json"])
+
+    lines = ["طلب تقديم جديد", ""]
+    lines.append(f"الاسم: {app_row['full_name'] or 'غير متوفر'}")
+    lines.append(
+        f"اليوزر: @{app_row['username']}"
+        if app_row["username"]
+        else "اليوزر: غير متوفر"
+    )
+    lines.append(f"الايدي: {app_row['user_id']}")
+    lines.append(
+        "القسم: "
+        + DEPARTMENT_OPTIONS.get(app_row["department"], app_row["department"] or "غير محدد")
+    )
+    lines.append("")
+
+    for key, label in APPLY_QUESTIONS.items():
+        if key == "department":
+            continue
+        if key in answers:
+            lines.append(f"{label}")
+            lines.append(str(answers[key]))
+            lines.append("")
+
+    lines.append(f"رقم الطلب: {app_row['id']}")
     return "\n".join(lines).strip()
 
 # ============================================================
@@ -785,7 +1225,6 @@ async def unlock_common_group(bot, chat_id):
         use_independent_chat_permissions=True,
     )
     db.clear_common_lock()
-
 
 # ============================================================
 # Platform workflows
@@ -997,9 +1436,9 @@ async def text_router(update, context):
     user_id = update.effective_user.id
 
     if not db.get_user(user_id):
-        await update.message.reply_text(
-            "لا تملك صلاحية استخدام البوت."
-        )
+        # المستخدم ليس عضوًا: نعرض له رسالة الترحيب وخيار التقديم
+        # بدل رسالة "لا تملك صلاحية" فقط.
+        await send_welcome_content(context.bot, update.effective_chat.id)
         return
 
     session = db.get_session(user_id)
@@ -1182,6 +1621,7 @@ async def approve_callback(update, context):
         return
 
     try:
+        # الشدة تُرسل إلى كروب المنصة المخصص فقط، وليس إلى الكروب العام.
         message = await context.bot.send_message(
             group["chat_id"],
             format_request(request),
@@ -1192,25 +1632,6 @@ async def approve_callback(update, context):
             group["chat_id"],
             message.message_id,
         )
-
-        # أرسل نسخة إلى الكروب العام، ثم اقفل الكروب العام فقط.
-        common = db.get_group("common")
-        if common:
-            try:
-                await context.bot.send_message(
-                    common["chat_id"],
-                    format_request(request),
-                )
-                await lock_common_group(context.bot, common["chat_id"])
-            except (TelegramError, RuntimeError) as exc:
-                db.log_event(
-                    "ERROR",
-                    "common_group_failed",
-                    user_id,
-                    request_id,
-                    str(exc),
-                )
-                # فشل الكروب العام لا يلغي نزول الشدة في كروب المنصة.
 
         try:
             await context.bot.pin_chat_message(
@@ -1242,50 +1663,38 @@ async def approve_callback(update, context):
             )
             return
 
-        # إرسال نسخة إلى الكروب العام.
-        common_message = await send_to_common_group(
-            context.bot,
-            request,
-        )
+        # نقفل الكروب العام فقط (بدون إرسال نسخة من الشدة إليه) طوال مدة الشد.
+        common = db.get_group("common")
+        if common:
+            try:
+                await lock_common_group(
+                    context.bot,
+                    common["chat_id"],
+                )
 
-        if common_message:
-            db.log_event(
-                "INFO",
-                "sent_to_common_group",
-                user_id,
-                request_id,
-                str(common_message.message_id),
-            )
+            except (TelegramError, RuntimeError) as exc:
+                db.log_event(
+                    "ERROR",
+                    "lock_group_failed",
+                    user_id,
+                    request_id,
+                    str(exc),
+                )
 
-        try:
-            await lock_common_group(
-                context.bot,
-                request["platform"],
-                group["chat_id"],
-            )
+                await query.message.reply_text(
+                    "تم نزول الشدة، لكن تعذر قفل الكتابة في الكروب العام. "
+                    "تأكد أن البوت Administrator ولديه صلاحية تقييد الأعضاء."
+                )
 
-        except (TelegramError, RuntimeError) as exc:
-            db.log_event(
-                "ERROR",
-                "lock_group_failed",
-                user_id,
-                request_id,
-                str(exc),
-            )
+                await context.bot.send_message(
+                    request["user_id"],
+                    "تمت الموافقة على شدتك وتم نزولها.",
+                )
 
-            await query.message.reply_text(
-                "تم نزول الشدة، لكن تعذر قفل الكتابة. تأكد أن البوت Administrator ولديه صلاحية تقييد الأعضاء."
-            )
-
-            await context.bot.send_message(
-                request["user_id"],
-                "تمت الموافقة على شدتك وتم نزولها.",
-            )
-
-            await query.edit_message_reply_markup(
-                reply_markup=None
-            )
-            return
+                await query.edit_message_reply_markup(
+                    reply_markup=None
+                )
+                return
 
         await query.edit_message_reply_markup(
             reply_markup=finish_keyboard(request_id)
@@ -1495,6 +1904,673 @@ async def finish_callback(update, context):
             )
 
 # ============================================================
+# Apply-to-team feature (التقديم على التيم)
+# ============================================================
+
+def apply_question_order():
+    raw = db.get_setting("apply_question_order")
+
+    if raw:
+        try:
+            order = json.loads(raw)
+            if (
+                isinstance(order, list)
+                and set(order) == set(APPLY_QUESTIONS.keys())
+            ):
+                return order
+        except Exception:
+            pass
+
+    return list(APPLY_QUESTIONS.keys())
+
+
+async def send_welcome_content(bot, chat_id):
+    media_type = db.get_setting("welcome_media_type", "text")
+    caption = db.get_setting("welcome_caption", "") or (
+        "مرحبًا بك، اضغط على التقديم للانضمام إلى التيم."
+    )
+    file_id = db.get_setting("welcome_media_file_id", "")
+
+    try:
+        if media_type == "photo" and file_id:
+            await bot.send_photo(
+                chat_id,
+                file_id,
+                caption=caption,
+                reply_markup=welcome_keyboard(),
+            )
+        elif media_type == "video" and file_id:
+            await bot.send_video(
+                chat_id,
+                file_id,
+                caption=caption,
+                reply_markup=welcome_keyboard(),
+            )
+        else:
+            await bot.send_message(
+                chat_id,
+                caption,
+                reply_markup=welcome_keyboard(),
+            )
+    except TelegramError as exc:
+        db.log_event(
+            "ERROR",
+            "send_welcome_failed",
+            None,
+            None,
+            str(exc),
+        )
+
+
+async def send_next_apply_question(bot, chat_id, user_id):
+    session = db.get_session(user_id)
+
+    if not session or session[0] != APPLY_STATE:
+        return
+
+    data = session[1]
+    order = data.get("order", [])
+    idx = data.get("idx", 0)
+
+    if idx >= len(order):
+        await finalize_application(bot, user_id, data)
+        return
+
+    key = order[idx]
+
+    if key == "department":
+        await bot.send_message(
+            chat_id,
+            APPLY_QUESTIONS[key],
+            reply_markup=department_keyboard(),
+        )
+    else:
+        await bot.send_message(
+            chat_id,
+            APPLY_QUESTIONS[key],
+            reply_markup=cancel_apply_keyboard(),
+        )
+
+
+async def finalize_application(bot, user_id, data):
+    db.clear_session(user_id)
+
+    answers = data.get("answers", {})
+    department = answers.get("department", "both")
+    username = data.get("username")
+    full_name = data.get("full_name") or str(user_id)
+
+    app_id = db.create_application(
+        user_id,
+        username,
+        full_name,
+        department,
+        answers,
+    )
+
+    app_row = db.get_application(app_id)
+
+    try:
+        await bot.send_message(
+            FOUNDER_ID,
+            format_application(app_row),
+            reply_markup=application_keyboard(app_id),
+        )
+    except TelegramError as exc:
+        db.log_event(
+            "ERROR",
+            "notify_founder_application_failed",
+            user_id,
+            app_id,
+            str(exc),
+        )
+
+    await bot.send_message(
+        user_id,
+        "تم إرسال طلب التقديم، الرجاء انتظار الرد من الإدارة.",
+    )
+
+
+async def make_invite_link(bot, chat_id):
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id,
+            member_limit=1,
+        )
+        return invite.invite_link
+    except TelegramError as exc:
+        db.log_event(
+            "ERROR",
+            "invite_link_failed",
+            None,
+            None,
+            str(exc),
+        )
+        return None
+
+
+async def apply_start_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if db.get_user(user_id):
+        await query.answer(
+            "أنت عضو بالفعل.",
+            show_alert=True,
+        )
+        return
+
+    if db.get_pending_application(user_id):
+        await query.answer(
+            "لديك طلب تقديم قيد المراجعة بالفعل.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    order = apply_question_order()
+
+    db.set_session(
+        user_id,
+        APPLY_STATE,
+        {
+            "order": order,
+            "idx": 0,
+            "answers": {},
+            "username": query.from_user.username,
+            "full_name": query.from_user.full_name,
+        },
+    )
+
+    await query.message.reply_text(
+        "سيتم الآن سؤالك عدة أسئلة للتقديم على التيم."
+    )
+
+    await send_next_apply_question(
+        context.bot,
+        query.message.chat_id,
+        user_id,
+    )
+
+
+async def apply_text_router(update, context):
+    if not update.message or not update.message.text:
+        return False
+
+    user_id = update.effective_user.id
+    session = db.get_session(user_id)
+
+    if not session or session[0] != APPLY_STATE:
+        return False
+
+    data = session[1]
+    order = data.get("order", [])
+    idx = data.get("idx", 0)
+
+    if idx >= len(order):
+        return False
+
+    key = order[idx]
+
+    if key == "department":
+        await update.message.reply_text(
+            "الرجاء اختيار القسم من الأزرار."
+        )
+        return True
+
+    text = update.message.text.strip()
+
+    if not text:
+        await update.message.reply_text(
+            "الرجاء إرسال إجابة نصية."
+        )
+        return True
+
+    data.setdefault("answers", {})[key] = text
+    data["idx"] = idx + 1
+
+    db.set_session(user_id, APPLY_STATE, data)
+
+    await send_next_apply_question(
+        context.bot,
+        update.effective_chat.id,
+        user_id,
+    )
+    return True
+
+
+async def apply_department_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+    session = db.get_session(user_id)
+
+    if not session or session[0] != APPLY_STATE:
+        await query.answer()
+        return
+
+    data = session[1]
+    order = data.get("order", [])
+    idx = data.get("idx", 0)
+
+    if idx >= len(order) or order[idx] != "department":
+        await query.answer()
+        return
+
+    value = query.data.split(":", 1)[1]
+
+    if value not in DEPARTMENT_OPTIONS:
+        await query.answer()
+        return
+
+    await query.answer()
+
+    data.setdefault("answers", {})["department"] = value
+    data["idx"] = idx + 1
+
+    db.set_session(user_id, APPLY_STATE, data)
+
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    await send_next_apply_question(
+        context.bot,
+        query.message.chat_id,
+        user_id,
+    )
+
+
+async def apply_cancel_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    db.clear_session(user_id)
+
+    await query.answer("تم إلغاء التقديم.")
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+
+async def application_approve_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not is_founder(user_id):
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        app_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer(
+            "رقم الطلب غير صحيح.",
+            show_alert=True,
+        )
+        return
+
+    app_row = db.get_application(app_id)
+
+    if not app_row:
+        await query.answer(
+            "الطلب غير موجود.",
+            show_alert=True,
+        )
+        return
+
+    if app_row["status"] != "PENDING":
+        await query.answer(
+            "تمت معالجة الطلب بالفعل.",
+            show_alert=True,
+        )
+        return
+
+    db.set_application_status(app_id, "APPROVED", user_id)
+
+    db.add_user(
+        app_row["user_id"],
+        app_row["username"],
+        app_row["full_name"] or str(app_row["user_id"]),
+        "member",
+    )
+
+    department = app_row["department"]
+    target_platforms = []
+
+    if department in ("instagram", "both"):
+        target_platforms.append("instagram")
+    if department in ("telegram", "both"):
+        target_platforms.append("telegram")
+    if department not in ("instagram", "telegram", "both"):
+        target_platforms = list(PLATFORMS)
+
+    links = []
+
+    for platform in target_platforms:
+        group = db.get_group(platform)
+        if not group:
+            continue
+        link = await make_invite_link(context.bot, group["chat_id"])
+        if link:
+            links.append(f"كروب {platform}: {link}")
+
+    common = db.get_group("common")
+    if common:
+        link = await make_invite_link(context.bot, common["chat_id"])
+        if link:
+            links.append(f"الكروب العام: {link}")
+
+    message_lines = ["تهانينا، تم قبول طلبك في التيم."]
+
+    if links:
+        message_lines.append("")
+        message_lines.extend(links)
+    else:
+        message_lines.append(
+            "سيتم تزويدك بروابط الكروبات قريبًا."
+        )
+
+    try:
+        await context.bot.send_message(
+            app_row["user_id"],
+            "\n".join(message_lines),
+        )
+    except TelegramError as exc:
+        db.log_event(
+            "ERROR",
+            "notify_applicant_approved_failed",
+            user_id,
+            app_id,
+            str(exc),
+        )
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.answer("تم قبول الطلب.")
+
+
+async def application_reject_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not is_founder(user_id):
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        app_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer(
+            "رقم الطلب غير صحيح.",
+            show_alert=True,
+        )
+        return
+
+    app_row = db.get_application(app_id)
+
+    if not app_row:
+        await query.answer(
+            "الطلب غير موجود.",
+            show_alert=True,
+        )
+        return
+
+    if app_row["status"] != "PENDING":
+        await query.answer(
+            "تمت معالجة الطلب بالفعل.",
+            show_alert=True,
+        )
+        return
+
+    db.set_application_status(app_id, "REJECTED", user_id)
+
+    try:
+        await context.bot.send_message(
+            app_row["user_id"],
+            "نأسف، تم رفض طلب التقديم الخاص بك.",
+        )
+    except TelegramError as exc:
+        db.log_event(
+            "ERROR",
+            "notify_applicant_rejected_failed",
+            user_id,
+            app_id,
+            str(exc),
+        )
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.answer("تم رفض الطلب.")
+
+
+async def noop_callback(update, context):
+    await update.callback_query.answer()
+
+
+async def apply_order_move_callback(update, context):
+    query = update.callback_query
+
+    if not is_founder(query.from_user.id):
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    _, _, action, key = query.data.split(":", 3)
+    order = apply_question_order()
+
+    if key not in order:
+        return
+
+    idx = order.index(key)
+    swap_idx = idx - 1 if action == "up" else idx + 1
+
+    if 0 <= swap_idx < len(order):
+        order[idx], order[swap_idx] = order[swap_idx], order[idx]
+        db.set_setting(
+            "apply_question_order",
+            json.dumps(order, ensure_ascii=False),
+        )
+
+    await query.edit_message_reply_markup(
+        reply_markup=apply_order_keyboard()
+    )
+
+
+async def founder_apply_menu_callback_entry(query):
+    """Shared body used from founder_callback for the 'founder:apply' key."""
+    await query.edit_message_text(
+        "إعدادات ميزة التقديم",
+        reply_markup=founder_apply_keyboard(),
+    )
+
+
+async def founder_apply_action_callback(update, context):
+    query = update.callback_query
+
+    if not is_founder(query.from_user.id):
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    action = query.data.split(":", 1)[1]
+
+    if action == "set_welcome":
+        db.set_session(query.from_user.id, "FOUNDER_SET_WELCOME", {})
+        await query.edit_message_text(
+            "أرسل رسالة الترحيب الآن.\n"
+            "يمكنك إرسال صورة أو فيديو مع نص (Caption)، أو إرسال نص فقط."
+        )
+        return
+
+    if action == "order":
+        await query.edit_message_text(
+            "رتب أسئلة التقديم كما تريد:",
+            reply_markup=apply_order_keyboard(),
+        )
+        return
+
+    if action == "preview":
+        await send_welcome_content(context.bot, query.message.chat_id)
+        return
+
+
+async def founder_welcome_media_router(update, context):
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+
+    if not is_founder(user_id):
+        return
+
+    session = db.get_session(user_id)
+
+    if not session or session[0] != "FOUNDER_SET_WELCOME":
+        return
+
+    caption = update.message.caption or ""
+
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        db.set_setting("welcome_media_type", "photo")
+        db.set_setting("welcome_media_file_id", file_id)
+        db.set_setting("welcome_caption", caption)
+
+    elif update.message.video:
+        file_id = update.message.video.file_id
+        db.set_setting("welcome_media_type", "video")
+        db.set_setting("welcome_media_file_id", file_id)
+        db.set_setting("welcome_caption", caption)
+
+    else:
+        return
+
+    db.clear_session(user_id)
+
+    await update.message.reply_text(
+        "تم حفظ رسالة الترحيب.",
+        reply_markup=founder_apply_keyboard(),
+    )
+
+
+async def founder_backup_action_callback(update, context):
+    query = update.callback_query
+
+    if not is_founder(query.from_user.id):
+        await query.answer(
+            "لا تملك صلاحية الإدارة.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    action = query.data.split(":", 1)[1]
+
+    if action == "backup_export":
+        data = db.export_config()
+        blob = encode_config_blob(data)
+
+        if len(blob) <= CONFIG_BACKUP_INLINE_LIMIT:
+            await context.bot.send_message(
+                query.from_user.id,
+                "احفظ هذا الكود في مكان آمن. استخدمه لاسترجاع إعدادات "
+                "البوت في حال تغيير الاستضافة:\n\n"
+                f"<code>{blob}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            buffer = BytesIO(blob.encode("ascii"))
+            buffer.name = "shd_bot_backup.txt"
+            await context.bot.send_document(
+                query.from_user.id,
+                buffer,
+                caption=(
+                    "احفظ هذا الملف في مكان آمن. استخدمه لاسترجاع "
+                    "إعدادات البوت في حال تغيير الاستضافة."
+                ),
+            )
+        return
+
+    if action == "backup_import":
+        db.set_session(query.from_user.id, "FOUNDER_IMPORT_CONFIG", {})
+        await query.edit_message_text(
+            "أرسل كود الاسترجاع الآن، إما كنص أو كملف .txt."
+        )
+        return
+
+
+async def apply_config_code(bot, user_id, raw_text):
+    try:
+        data = decode_config_blob(raw_text)
+        db.import_config(data)
+    except Exception as exc:
+        db.log_event(
+            "ERROR",
+            "import_config_failed",
+            user_id,
+            None,
+            str(exc),
+        )
+        await bot.send_message(
+            user_id,
+            "الكود غير صالح أو تالف. تأكد من نسخه أو رفعه كاملًا.",
+        )
+        return False
+
+    await bot.send_message(
+        user_id,
+        "تم استرجاع إعدادات البوت بنجاح.",
+    )
+    return True
+
+
+async def founder_import_document_router(update, context):
+    if not update.message or not update.message.document:
+        return
+
+    user_id = update.effective_user.id
+
+    if not is_founder(user_id):
+        return
+
+    session = db.get_session(user_id)
+
+    if not session or session[0] != "FOUNDER_IMPORT_CONFIG":
+        return
+
+    try:
+        file = await update.message.document.get_file()
+        raw_bytes = await file.download_as_bytearray()
+        text = bytes(raw_bytes).decode("utf-8", errors="strict")
+    except Exception as exc:
+        db.log_event(
+            "ERROR",
+            "import_config_file_failed",
+            user_id,
+            None,
+            str(exc),
+        )
+        await update.message.reply_text("تعذر قراءة الملف.")
+        return
+
+    db.clear_session(user_id)
+    await apply_config_code(context.bot, user_id, text)
+
+# ============================================================
 # Founder panel
 # ============================================================
 
@@ -1509,9 +2585,7 @@ async def start(update, context):
     user_id = update.effective_user.id
 
     if not db.get_user(user_id):
-        await update.message.reply_text(
-            "لا تملك صلاحية استخدام البوت."
-        )
+        await send_welcome_content(context.bot, update.effective_chat.id)
         return
 
     if is_founder(user_id):
@@ -1569,6 +2643,17 @@ async def founder_callback(update, context):
         await query.edit_message_text(
             "إدارة المنصات",
             reply_markup=founder_platforms_keyboard(),
+        )
+
+    elif key == "founder:apply":
+        await founder_apply_menu_callback_entry(query)
+
+    elif key == "founder:backup":
+        await query.edit_message_text(
+            "نسخ احتياطي للإعدادات\n\n"
+            "التصدير يعطيك كودًا يحفظ الأعضاء والمشرفين والكروبات "
+            "وإعدادات ميزة التقديم. لا يشمل سجل الطلبات القديمة.",
+            reply_markup=founder_backup_keyboard(),
         )
 
     elif key == "founder:requests":
@@ -1801,6 +2886,25 @@ async def founder_text_router(update, context):
     state = session[0]
     text = update.message.text.strip()
 
+    if state == "FOUNDER_SET_WELCOME":
+        db.set_setting("welcome_media_type", "text")
+        db.set_setting("welcome_media_file_id", "")
+        db.set_setting("welcome_caption", text)
+
+        db.clear_session(user_id)
+
+        await update.message.reply_text(
+            "تم حفظ رسالة الترحيب.",
+            reply_markup=founder_apply_keyboard(),
+        )
+
+        return True
+
+    if state == "FOUNDER_IMPORT_CONFIG":
+        db.clear_session(user_id)
+        await apply_config_code(context.bot, user_id, text)
+        return True
+
     try:
         if state == "FOUNDER_ADD_USER":
             uid_s, name = [
@@ -1922,6 +3026,9 @@ async def founder_text_router(update, context):
 
 async def route_text(update, context):
     if await founder_text_router(update, context):
+        return
+
+    if await apply_text_router(update, context):
         return
 
     await text_router(update, context)
@@ -2058,6 +3165,85 @@ def build_app():
         CallbackQueryHandler(
             founder_platform_callback,
             pattern=r"^f:platform:(telegram|instagram|tiktok)$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            founder_apply_action_callback,
+            pattern=r"^f:apply_(set_welcome|order|preview)$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            founder_backup_action_callback,
+            pattern=r"^f:backup_(export|import)$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            apply_order_move_callback,
+            pattern=r"^f:apply_order:(up|down):.+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            noop_callback,
+            pattern=r"^noop$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            apply_start_callback,
+            pattern=r"^apply:start$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            apply_department_callback,
+            pattern=r"^apply_dept:(instagram|telegram|both)$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            apply_cancel_callback,
+            pattern=r"^apply_cancel$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            application_approve_callback,
+            pattern=r"^app_approve:\d+$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            application_reject_callback,
+            pattern=r"^app_reject:\d+$",
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & (filters.PHOTO | filters.VIDEO)
+            & ~filters.COMMAND,
+            founder_welcome_media_router,
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.Document.ALL & ~filters.COMMAND,
+            founder_import_document_router,
         )
     )
 

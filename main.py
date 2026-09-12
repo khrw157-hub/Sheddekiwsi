@@ -57,6 +57,12 @@ if not FOUNDER_ID:
 PLATFORMS = ("telegram", "instagram", "tiktok")
 COMMON_PLATFORM = "common"
 
+PLATFORM_LABELS = {
+    "telegram": "تيليجرام",
+    "instagram": "انستقرام",
+    "tiktok": "تيك توك",
+}
+
 TEAM_LINK_URL = "https://t.me/team_dark8"
 
 # ============================================================
@@ -1663,7 +1669,8 @@ async def approve_callback(update, context):
             )
             return
 
-        # نقفل الكروب العام فقط (بدون إرسال نسخة من الشدة إليه) طوال مدة الشد.
+        # نقفل الكروب العام فقط (بدون إرسال نسخة من الشدة إليه) طوال مدة الشد،
+        # ونرسل تنبيهًا للأعضاء يوجههم إلى كروب المنصة المخصص.
         common = db.get_group("common")
         if common:
             try:
@@ -1671,6 +1678,29 @@ async def approve_callback(update, context):
                     context.bot,
                     common["chat_id"],
                 )
+
+                platform_label = PLATFORM_LABELS.get(
+                    request["platform"],
+                    request["platform"],
+                )
+
+                try:
+                    await context.bot.send_message(
+                        common["chat_id"],
+                        (
+                            "تم قفل الدردشة، نزلت شدّة، الكل يتوجه لقسم "
+                            f"\"{platform_label}\"، حطوا لايك على الشدة "
+                            "بعدما تخلص."
+                        ),
+                    )
+                except TelegramError as exc:
+                    db.log_event(
+                        "ERROR",
+                        "common_group_notice_failed",
+                        user_id,
+                        request_id,
+                        str(exc),
+                    )
 
             except (TelegramError, RuntimeError) as exc:
                 db.log_event(

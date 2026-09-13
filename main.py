@@ -26,6 +26,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ChatJoinRequestHandler,
     filters,
 )
 from telegram.error import TelegramError
@@ -3557,7 +3558,7 @@ def build_app():
     )
 
     app.add_handler(
-        MessageHandler(filters.StatusUpdate.CHAT_JOIN_REQUEST, member_join_request)
+        ChatJoinRequestHandler(member_join_request)
     )
 
     app.add_handler(

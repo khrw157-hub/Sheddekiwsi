@@ -3742,7 +3742,7 @@ def build_app():
             pattern=(
                 r"^f:(add_user|remove_user|list_users|manage_users|user|user_delete|user_delete_confirm|user_dept|user_dept_set|"
                 r"add_admin|remove_admin|list_admins|team_users|team_admins|team_status|"
-                r"member_link|set_department|ann_new|ann_list|templates|meeting_new|meeting_list)$"
+                r"member_link|set_department|ann_new|ann_list|templates|meeting_new|meeting_list)(:.*)?$"
             ),
         )
     )

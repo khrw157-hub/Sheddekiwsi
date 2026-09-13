@@ -1113,7 +1113,7 @@ def founder_keyboard():
 
 def team_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("الأعضاء", callback_data="f:team_users"), InlineKeyboardButton("المشرفون والصلاحيات", callback_data="f:team_admins")],
+        [InlineKeyboardButton("الأعضاء", callback_data="founder:users"), InlineKeyboardButton("المشرفون والصلاحيات", callback_data="founder:admins")],
         [InlineKeyboardButton("حالة التيم", callback_data="f:team_status")],
         [InlineKeyboardButton("رجوع", callback_data="founder:home")],
     ])
@@ -1152,8 +1152,9 @@ def audience_keyboard(kind):
 
 def founder_users_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("إضافة عضو", callback_data="f:add_user")],
-        [InlineKeyboardButton("إدارة الأعضاء", callback_data="f:manage_users")],
+        [InlineKeyboardButton("إضافة عضو جديد", callback_data="f:add_user")],
+        [InlineKeyboardButton("تعديل أو حذف عضو", callback_data="f:manage_users")],
+        [InlineKeyboardButton("عرض كل الأعضاء", callback_data="f:team_users")],
         [InlineKeyboardButton("رابط دخول عضو", callback_data="f:member_link")],
         [InlineKeyboardButton("رجوع", callback_data="founder:team")],
     ])
@@ -1198,12 +1199,12 @@ def founder_admins_keyboard():
             callback_data="f:remove_admin",
         )],
         [InlineKeyboardButton(
-            "قائمة المشرفين",
+            "عرض المشرفين",
             callback_data="f:list_admins",
         )],
         [InlineKeyboardButton(
             "رجوع",
-            callback_data="founder:home",
+            callback_data="founder:team",
         )],
     ])
 
@@ -1689,6 +1690,13 @@ async def cancel_callback(update, context):
         return
 
     db.clear_session(user_id)
+
+    if is_founder(user_id):
+        await query.edit_message_text(
+            "تم إلغاء العملية.",
+            reply_markup=founder_keyboard(),
+        )
+        return
 
     await query.edit_message_text(
         "تم إلغاء العملية.",
@@ -3112,16 +3120,25 @@ async def founder_action_callback(update, context):
     prompts = {
         "add_user": (
             "أرسل ID العضو ثم الاسم بهذا الشكل:\n"
-            "123456789 | الاسم"
+            "123456789 | الاسم\n\n"
+            "ملاحظة: لمعرفة رقم آيدي أي شخص، اطلب منه إرسال أي رسالة "
+            "لبوت مثل @userinfobot وسيرسل له رقمه."
         ),
         "remove_user": (
-            "أرسل ID العضو المراد حذفه."
+            "أرسل ID العضو المراد حذفه فقط (رقم واحد).\n"
+            "مثال: 123456789\n\n"
+            "يمكنك أيضًا استخدام زر \"تعديل أو حذف عضو\" لاختيار العضو من قائمة بدل كتابة الرقم."
         ),
         "add_admin": (
-            "أرسل ID المشرف ثم المنصة بهذا الشكل:\n"
-            "123456789 | telegram"
+            "أرسل ID المشرف ثم اسم المنصة بهذا الشكل:\n"
+            "123456789 | telegram\n\n"
+            "المنصات المتاحة: telegram، instagram، tiktok."
         ),
-        "remove_admin": ("أرسل ID المشرف ثم المنصة بهذا الشكل:\n123456789 | telegram"),
+        "remove_admin": (
+            "أرسل ID المشرف ثم اسم المنصة بهذا الشكل:\n"
+            "123456789 | telegram\n\n"
+            "المنصات المتاحة: telegram، instagram، tiktok."
+        ),
         "member_link": ("أرسل ID العضو لإصدار روابط دخول خاصة له."),
         "set_department": ("أرسل ID العضو ثم القسم: programming أو band"),
         "meeting_new": ("أرسل بيانات الاجتماع بهذا الشكل:\nالعنوان | 2026-09-13T20:00:00+03:00 | التفاصيل | all\nالجمهور: all أو programming أو band أو telegram أو instagram أو tiktok"),
@@ -3185,7 +3202,8 @@ async def founder_action_callback(update, context):
         )
 
         await query.edit_message_text(
-            prompts[action]
+            prompts[action],
+            reply_markup=cancel_keyboard(),
         )
         return
 
@@ -3452,7 +3470,7 @@ async def founder_text_router(update, context):
         await update.message.reply_text("تم إنشاء الاجتماع وجدولة التذكير قبل ساعة وقبل 10 دقائق.",reply_markup=meetings_keyboard()); return True
 
     if state.startswith("FOUNDER_TEMPLATE_"):
-        key=state[len("FOUNDER_TEMPLATE_")]; db.set_template("template_"+key,text); db.clear_session(user_id); await update.message.reply_text("تم حفظ القالب.",reply_markup=announcements_keyboard()); return True
+        key=state[len("FOUNDER_TEMPLATE_"):]; db.set_template("template_"+key,text); db.clear_session(user_id); await update.message.reply_text("تم حفظ القالب.",reply_markup=announcements_keyboard()); return True
 
     try:
         if state == "FOUNDER_ADD_USER":
@@ -3473,21 +3491,28 @@ async def founder_text_router(update, context):
             db.clear_session(user_id)
 
             await update.message.reply_text(
-                "تمت إضافة العضو.",
-                reply_markup=founder_keyboard(),
+                f"تمت إضافة العضو {name} (ID: {uid}) بنجاح.",
+                reply_markup=founder_users_keyboard(),
             )
 
             return True
 
         if state == "FOUNDER_REMOVE_USER":
             target=int(text)
+            if not db.get_user(target):
+                await update.message.reply_text(
+                    "لا يوجد عضو بهذا الآيدي.",
+                    reply_markup=founder_users_keyboard(),
+                )
+                db.clear_session(user_id)
+                return True
             removed=await kick_member_from_all_groups(context.bot,target)
             db.remove_user(target)
             db.clear_session(user_id)
 
             await update.message.reply_text(
                 f"تم حذف العضو وطرده من {removed} كروب.",
-                reply_markup=founder_keyboard(),
+                reply_markup=founder_users_keyboard(),
             )
 
             return True
@@ -3519,20 +3544,26 @@ async def founder_text_router(update, context):
             db.clear_session(user_id)
 
             await update.message.reply_text(
-                "تمت إضافة المشرف وربطه بالمنصة.",
-                reply_markup=founder_keyboard(),
+                f"تمت إضافة المشرف (ID: {uid}) على منصة {PLATFORM_LABELS.get(platform, platform)}.",
+                reply_markup=founder_admins_keyboard(),
             )
 
             return True
 
         if state == "FOUNDER_REMOVE_ADMIN":
             parts=[x.strip() for x in text.split("|",1)]
-            db.remove_admin(int(parts[0]), parts[1].lower() if len(parts)>1 else None)
+            if len(parts) < 2 or parts[1].lower() not in PLATFORMS:
+                await update.message.reply_text(
+                    "الصيغة غير صحيحة. أرسل: ID | المنصة (telegram أو instagram أو tiktok)",
+                    reply_markup=cancel_keyboard(),
+                )
+                return True
+            db.remove_admin(int(parts[0]), parts[1].lower())
             db.clear_session(user_id)
 
             await update.message.reply_text(
                 "تم حذف المشرف.",
-                reply_markup=founder_keyboard(),
+                reply_markup=founder_admins_keyboard(),
             )
 
             return True
@@ -3566,7 +3597,8 @@ async def founder_text_router(update, context):
 
     except (ValueError, IndexError):
         await update.message.reply_text(
-            "القيمة غير صحيحة. أرسلها بالشكل المطلوب."
+            "القيمة غير صحيحة. أرسلها بالشكل المطلوب، أو اضغط إلغاء.",
+            reply_markup=cancel_keyboard(),
         )
         return True
 

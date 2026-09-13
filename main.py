@@ -1154,7 +1154,6 @@ def founder_users_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("إضافة عضو", callback_data="f:add_user")],
         [InlineKeyboardButton("إدارة الأعضاء", callback_data="f:manage_users")],
-        [InlineKeyboardButton("رابط دخول عضو", callback_data="f:member_link")],
         [InlineKeyboardButton("رجوع", callback_data="founder:team")],
     ])
 
@@ -1183,6 +1182,9 @@ def user_department_keyboard(user_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("البرمجة", callback_data=f"f:user_dept_set:{user_id}:programming")],
         [InlineKeyboardButton("الباند", callback_data=f"f:user_dept_set:{user_id}:band")],
+        [InlineKeyboardButton("انستقرام", callback_data=f"f:user_dept_set:{user_id}:instagram")],
+        [InlineKeyboardButton("تيليجرام", callback_data=f"f:user_dept_set:{user_id}:telegram")],
+        [InlineKeyboardButton("تيك توك", callback_data=f"f:user_dept_set:{user_id}:tiktok")],
         [InlineKeyboardButton("إلغاء", callback_data=f"f:user:{user_id}")],
     ])
 
@@ -3114,16 +3116,11 @@ async def founder_action_callback(update, context):
             "أرسل ID العضو ثم الاسم بهذا الشكل:\n"
             "123456789 | الاسم"
         ),
-        "remove_user": (
-            "أرسل ID العضو المراد حذفه."
-        ),
         "add_admin": (
             "أرسل ID المشرف ثم المنصة بهذا الشكل:\n"
             "123456789 | telegram"
         ),
         "remove_admin": ("أرسل ID المشرف ثم المنصة بهذا الشكل:\n123456789 | telegram"),
-        "member_link": ("أرسل ID العضو لإصدار روابط دخول خاصة له."),
-        "set_department": ("أرسل ID العضو ثم القسم: programming أو band"),
         "meeting_new": ("أرسل بيانات الاجتماع بهذا الشكل:\nالعنوان | 2026-09-13T20:00:00+03:00 | التفاصيل | all\nالجمهور: all أو programming أو band أو telegram أو instagram أو tiktok"),
     }
 
@@ -3173,6 +3170,9 @@ async def founder_action_callback(update, context):
     if action == "user_dept_set":
         parts = query.data.split(":")
         uid = int(parts[2]); dept = parts[3]
+        if dept not in ("programming", "band", "instagram", "telegram", "tiktok"):
+            await query.answer("القسم غير صحيح.", show_alert=True)
+            return
         db.set_department(uid, dept)
         await query.edit_message_text("تم تحديث قسم العضو.", reply_markup=user_manage_keyboard(uid))
         return
@@ -3416,27 +3416,6 @@ async def founder_text_router(update, context):
     if state == "FOUNDER_ANN_TEXT":
         data=session[1]; await send_announcement(context.bot,data["kind"],data["audience"],text,user_id,data.get("department"),data.get("platform")); db.clear_session(user_id); await update.message.reply_text("تم إرسال الإعلان.",reply_markup=announcements_keyboard()); return True
 
-    if state == "FOUNDER_MEMBER_LINK":
-        try: uid=int(text)
-        except ValueError: await update.message.reply_text("أرسل ID صحيحًا."); return True
-        if not db.get_user(uid): await update.message.reply_text("العضو غير موجود."); return True
-        links=[]
-        targets=list(PLATFORMS)+[COMMON_PLATFORM]
-        for platform in targets:
-            group=db.get_group(platform)
-            if group:
-                link=await make_member_invite(context.bot,group["chat_id"],uid,platform)
-                if link: links.append(f"{PLATFORM_LABELS.get(platform,'الكروب العام')}: {link}")
-        db.clear_session(user_id)
-        await context.bot.send_message(uid,"روابط الدخول الخاصة بك:\n\n"+"\n".join(links) if links else "تعذر إنشاء الروابط حاليًا.")
-        await update.message.reply_text("تم إصدار الروابط وإرسالها للعضو.",reply_markup=founder_users_keyboard()); return True
-
-    if state == "FOUNDER_SET_DEPARTMENT":
-        try: uid_s,dept=text.split("|",1); uid=int(uid_s.strip()); dept=dept.strip().lower()
-        except ValueError: await update.message.reply_text("الصيغة: ID | programming أو band"); return True
-        if dept not in ("programming","band"): await update.message.reply_text("القسم يجب أن يكون programming أو band."); return True
-        db.set_department(uid,dept); db.clear_session(user_id); await update.message.reply_text("تم تعيين القسم.",reply_markup=team_keyboard()); return True
-
     if state == "FOUNDER_MEETING_NEW":
         try: title,when,details,audience=[x.strip() for x in text.split("|",3)]
         except ValueError: await update.message.reply_text("الصيغة غير صحيحة."); return True
@@ -3470,26 +3449,51 @@ async def founder_text_router(update, context):
                 "member",
             )
 
+            # إنشاء روابط دعوة خاصة بالعضو وإرسالها له فقط.
+            links = []
+            for platform in PLATFORMS:
+                group = db.get_group(platform)
+                if not group:
+                    continue
+                link = await make_member_invite(
+                    context.bot,
+                    group["chat_id"],
+                    uid,
+                    platform,
+                )
+                if link:
+                    links.append(f"{PLATFORM_LABELS.get(platform, platform)}: {link}")
+
+            common = db.get_group(COMMON_PLATFORM)
+            if common:
+                link = await make_member_invite(
+                    context.bot,
+                    common["chat_id"],
+                    uid,
+                    COMMON_PLATFORM,
+                )
+                if link:
+                    links.append(f"الكروب العام: {link}")
+
             db.clear_session(user_id)
 
+            if links:
+                try:
+                    await context.bot.send_message(
+                        uid,
+                        "تمت إضافتك إلى التيم.\n\nروابط الدخول الخاصة بك:\n\n"
+                        + "\n".join(links),
+                    )
+                    result = "تمت إضافة العضو وإرسال روابط الدخول الخاصة له."
+                except TelegramError:
+                    result = "تمت إضافة العضو، لكن تعذر إرسال روابط الدخول له. تأكد أن العضو بدأ البوت أولًا."
+            else:
+                result = "تمت إضافة العضو، لكن لا توجد كروبات مضبوطة لإصدار روابط الدخول."
+
             await update.message.reply_text(
-                "تمت إضافة العضو.",
-                reply_markup=founder_keyboard(),
+                result,
+                reply_markup=founder_users_keyboard(),
             )
-
-            return True
-
-        if state == "FOUNDER_REMOVE_USER":
-            target=int(text)
-            removed=await kick_member_from_all_groups(context.bot,target)
-            db.remove_user(target)
-            db.clear_session(user_id)
-
-            await update.message.reply_text(
-                f"تم حذف العضو وطرده من {removed} كروب.",
-                reply_markup=founder_keyboard(),
-            )
-
             return True
 
         if state == "FOUNDER_ADD_ADMIN":
@@ -3708,9 +3712,10 @@ def build_app():
         CallbackQueryHandler(
             founder_action_callback,
             pattern=(
-                r"^f:(add_user|remove_user|list_users|manage_users|user|user_delete|user_delete_confirm|user_dept|user_dept_set|"
+                r"^f:(add_user|list_users|manage_users|user(?:[:_].+)?|user_delete(?:[:_].+)?|"
+                r"user_delete_confirm(?:[:_].+)?|user_dept(?:[:_].+)?|user_dept_set(?:[:_].+)?|"
                 r"add_admin|remove_admin|list_admins|team_users|team_admins|team_status|"
-                r"member_link|set_department|ann_new|ann_list|templates|meeting_new|meeting_list)$"
+                r"ann_new|ann_list|templates|meeting_new|meeting_list)$"
             ),
         )
     )

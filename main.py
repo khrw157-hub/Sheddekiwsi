@@ -1152,21 +1152,38 @@ def audience_keyboard(kind):
 
 def founder_users_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "إضافة عضو",
-            callback_data="f:add_user",
-        )],
-        [InlineKeyboardButton(
-            "حذف عضو",
-            callback_data="f:remove_user",
-        )],
-        [InlineKeyboardButton("قائمة الأعضاء", callback_data="f:list_users")],
+        [InlineKeyboardButton("إضافة عضو", callback_data="f:add_user")],
+        [InlineKeyboardButton("إدارة الأعضاء", callback_data="f:manage_users")],
         [InlineKeyboardButton("رابط دخول عضو", callback_data="f:member_link")],
-        [InlineKeyboardButton("تعيين قسم لعضو", callback_data="f:set_department")],
-        [InlineKeyboardButton(
-            "رجوع",
-            callback_data="founder:home",
-        )],
+        [InlineKeyboardButton("رجوع", callback_data="founder:team")],
+    ])
+
+def manage_users_keyboard(rows):
+    buttons = []
+    for r in rows:
+        name = (r["full_name"] or str(r["user_id"]))[:28]
+        buttons.append([InlineKeyboardButton(name, callback_data=f"f:user:{r['user_id']}")])
+    buttons.append([InlineKeyboardButton("رجوع", callback_data="founder:users")])
+    return InlineKeyboardMarkup(buttons)
+
+def user_manage_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("حذف العضو", callback_data=f"f:user_delete:{user_id}")],
+        [InlineKeyboardButton("تعيين القسم", callback_data=f"f:user_dept:{user_id}")],
+        [InlineKeyboardButton("رجوع للأعضاء", callback_data="f:manage_users")],
+    ])
+
+def user_delete_confirm_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("تأكيد الحذف", callback_data=f"f:user_delete_confirm:{user_id}")],
+        [InlineKeyboardButton("إلغاء", callback_data=f"f:user:{user_id}")],
+    ])
+
+def user_department_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("البرمجة", callback_data=f"f:user_dept_set:{user_id}:programming")],
+        [InlineKeyboardButton("الباند", callback_data=f"f:user_dept_set:{user_id}:band")],
+        [InlineKeyboardButton("إلغاء", callback_data=f"f:user:{user_id}")],
     ])
 
 
@@ -1482,6 +1499,7 @@ TELEGRAM_EMAIL = "WAITING_TELEGRAM_EMAIL"
 
 INSTAGRAM_USERNAME = "WAITING_INSTAGRAM_USERNAME"
 INSTAGRAM_SHD = "WAITING_INSTAGRAM_SHD"
+INSTAGRAM_MULTI = "WAITING_INSTAGRAM_MULTI"
 
 TIKTOK_DATA = "WAITING_TIKTOK_DATA"
 
@@ -1526,12 +1544,11 @@ async def telegram_text(user_id, state, text):
 
 
 async def start_instagram(user_id):
-    db.set_session(
-        user_id,
-        INSTAGRAM_USERNAME,
-        {},
-    )
-    return "أرسل يوزر الحساب.", cancel_keyboard()
+    return "اختر نوع الشدة:", InlineKeyboardMarkup([
+        [InlineKeyboardButton("حساب واحد", callback_data="instagram_mode:single")],
+        [InlineKeyboardButton("حسابات متعددة", callback_data="instagram_mode:multiple")],
+        [InlineKeyboardButton("إلغاء", callback_data="cancel")],
+    ])
 
 
 async def instagram_text(user_id, state, text):
@@ -1540,24 +1557,27 @@ async def instagram_text(user_id, state, text):
 
     if state == INSTAGRAM_USERNAME:
         username = text.strip().lstrip("@").strip()
-
-        if (
-            not username
-            or " " in username
-            or "/" in username
-        ):
+        if not username or " " in username or "/" in username:
             return "أرسل اليوزر بشكل صحيح.", cancel_keyboard()
-
         data["Username"] = f"@{username}"
         data["Instagram"] = f"https://instagram.com/{username}"
-
-        db.set_session(
-            user_id,
-            INSTAGRAM_SHD,
-            data,
-        )
-
+        db.set_session(user_id, INSTAGRAM_SHD, data)
         return "أرسل شدتك.", cancel_keyboard()
+
+    if state == INSTAGRAM_MULTI:
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        usernames = []
+        for value in lines:
+            username = value.lstrip("@").strip()
+            if not username or " " in username or "/" in username:
+                return "يوجد حساب غير صحيح. أرسل كل يوزر في سطر مستقل.", cancel_keyboard()
+            usernames.append(username)
+        if not usernames:
+            return "أرسل الحسابات، كل حساب في سطر مستقل.", cancel_keyboard()
+        data["Usernames"] = [f"@{u}" for u in usernames]
+        data["Instagram"] = [f"https://instagram.com/{u}" for u in usernames]
+        db.set_session(user_id, INSTAGRAM_SHD, data)
+        return f"تم استلام {len(usernames)} حساب. أرسل شدتك.", cancel_keyboard()
 
     if state == INSTAGRAM_SHD:
         data["الشدة"] = text
@@ -1714,6 +1734,7 @@ async def text_router(update, context):
 
     elif state in (
         INSTAGRAM_USERNAME,
+        INSTAGRAM_MULTI,
         INSTAGRAM_SHD,
     ):
         message, keyboard = await instagram_text(
@@ -3058,6 +3079,22 @@ async def feature_callback(update, context):
         db.set_session(query.from_user.id,"FOUNDER_TEMPLATE_"+key,{})
         await query.edit_message_text("أرسل نص القالب الجديد. المتغيرات المتاحة تعتمد على القالب."); return
 
+async def instagram_mode_callback(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not db.get_user(user_id):
+        await query.answer("لا تملك صلاحية استخدام البوت.", show_alert=True)
+        return
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    if mode == "single":
+        db.set_session(user_id, INSTAGRAM_USERNAME, {})
+        await query.edit_message_text("أرسل يوزر الحساب.", reply_markup=cancel_keyboard())
+    else:
+        db.set_session(user_id, INSTAGRAM_MULTI, {})
+        await query.edit_message_text("أرسل الحسابات، كل حساب في سطر مستقل.", reply_markup=cancel_keyboard())
+
+
 async def founder_action_callback(update, context):
     query = update.callback_query
 
@@ -3089,6 +3126,56 @@ async def founder_action_callback(update, context):
         "set_department": ("أرسل ID العضو ثم القسم: programming أو band"),
         "meeting_new": ("أرسل بيانات الاجتماع بهذا الشكل:\nالعنوان | 2026-09-13T20:00:00+03:00 | التفاصيل | all\nالجمهور: all أو programming أو band أو telegram أو instagram أو tiktok"),
     }
+
+    if action == "manage_users":
+        rows = db.list_users()
+        await query.edit_message_text("اختر العضو الذي تريد إدارته:", reply_markup=manage_users_keyboard(rows))
+        return
+
+    if action == "user":
+        uid = int(query.data.split(":")[2])
+        row = db.get_user(uid)
+        if not row:
+            await query.answer("العضو غير موجود.", show_alert=True)
+            return
+        dept = row["department"] or "غير محدد"
+        await query.edit_message_text(
+            f"العضو\n\nالاسم: {row['full_name']}\nالمعرف: {row['user_id']}\nالقسم: {dept}\nالصلاحية: {row['role']}",
+            reply_markup=user_manage_keyboard(uid),
+        )
+        return
+
+    if action == "user_delete":
+        uid = int(query.data.split(":")[2])
+        row = db.get_user(uid)
+        if not row:
+            await query.answer("العضو غير موجود.", show_alert=True)
+            return
+        await query.edit_message_text("هل أنت متأكد من حذف هذا العضو وطرده من جميع الأقسام؟", reply_markup=user_delete_confirm_keyboard(uid))
+        return
+
+    if action == "user_delete_confirm":
+        uid = int(query.data.split(":")[2])
+        row = db.get_user(uid)
+        if not row:
+            await query.answer("العضو غير موجود.", show_alert=True)
+            return
+        removed = await kick_member_from_all_groups(context.bot, uid)
+        db.remove_user(uid)
+        await query.edit_message_text(f"تم حذف العضو وطرده من {removed} كروب.", reply_markup=founder_users_keyboard())
+        return
+
+    if action == "user_dept":
+        uid = int(query.data.split(":")[2])
+        await query.edit_message_text("اختر القسم:", reply_markup=user_department_keyboard(uid))
+        return
+
+    if action == "user_dept_set":
+        parts = query.data.split(":")
+        uid = int(parts[2]); dept = parts[3]
+        db.set_department(uid, dept)
+        await query.edit_message_text("تم تحديث قسم العضو.", reply_markup=user_manage_keyboard(uid))
+        return
 
     if action in prompts:
         db.set_session(
@@ -3612,9 +3699,16 @@ def build_app():
 
     app.add_handler(
         CallbackQueryHandler(
+            instagram_mode_callback,
+            pattern=r"^instagram_mode:(single|multiple)$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
             founder_action_callback,
             pattern=(
-                r"^f:(add_user|remove_user|list_users|"
+                r"^f:(add_user|remove_user|list_users|manage_users|user|user_delete|user_delete_confirm|user_dept|user_dept_set|"
                 r"add_admin|remove_admin|list_admins|team_users|team_admins|team_status|"
                 r"member_link|set_department|ann_new|ann_list|templates|meeting_new|meeting_list)$"
             ),

@@ -25,6 +25,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ChatJoinRequestHandler,
     filters,
 )
 from telegram.error import TelegramError
@@ -225,6 +226,21 @@ class Database:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS member_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                invite_link TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                created_at TEXT NOT NULL,
+                used_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_member_invites_lookup
+            ON member_invites(chat_id, invite_link, status);
+            CREATE INDEX IF NOT EXISTS idx_member_invites_user
+            ON member_invites(user_id, status);
             """)
 
             for platform in PLATFORMS:
@@ -234,23 +250,9 @@ class Database:
                 )
 
     def log_event(self, level, event, user_id=None, request_id=None, details=None):
-        try:
-            with self.conn() as con:
-                con.execute(
-                    """INSERT INTO logs(
-                        level,event,user_id,request_id,details,created_at
-                    ) VALUES(?,?,?,?,?,?)""",
-                    (
-                        level,
-                        event,
-                        user_id,
-                        request_id,
-                        details,
-                        now_iso(),
-                    ),
-                )
-        except Exception:
-            log.exception("Could not write application log")
+        # السجلات معطلة لتخفيف الضغط على SQLite وRailway المجاني.
+        # تبقى دالة التوافق موجودة حتى لا تتأثر النسخة القديمة.
+        return None
 
     def get_user(self, user_id):
         with self.conn() as con:
@@ -269,7 +271,7 @@ class Database:
                 ON CONFLICT(user_id) DO UPDATE SET
                     username=excluded.username,
                     full_name=excluded.full_name,
-                    role=excluded.role,
+                    role=users.role,
                     active=1""",
                 (
                     user_id,
@@ -592,6 +594,43 @@ class Database:
         with self.conn() as con:
             con.execute(
                 "DELETE FROM sessions WHERE user_id=?",
+                (user_id,),
+            )
+
+    # -------------------- Member invite links --------------------
+
+    def add_member_invite(self, user_id, platform, chat_id, invite_link):
+        with self.conn() as con:
+            con.execute(
+                """INSERT INTO member_invites(
+                    user_id,platform,chat_id,invite_link,status,created_at
+                ) VALUES(?,?,?,?,?,?)""",
+                (user_id, platform, chat_id, invite_link, "PENDING", now_iso()),
+            )
+
+    def get_member_invite(self, chat_id, invite_link):
+        with self.conn() as con:
+            return con.execute(
+                """SELECT * FROM member_invites
+                   WHERE chat_id=? AND invite_link=? AND status='PENDING'
+                   ORDER BY id DESC LIMIT 1""",
+                (chat_id, invite_link),
+            ).fetchone()
+
+    def finish_member_invite(self, invite_id):
+        with self.conn() as con:
+            con.execute(
+                """UPDATE member_invites
+                   SET status='USED', used_at=?
+                   WHERE id=? AND status='PENDING'""",
+                (now_iso(), invite_id),
+            )
+
+    def cancel_member_invites(self, user_id):
+        with self.conn() as con:
+            con.execute(
+                """UPDATE member_invites SET status='CANCELLED'
+                   WHERE user_id=? AND status='PENDING'""",
                 (user_id,),
             )
 
@@ -1231,6 +1270,94 @@ async def unlock_common_group(bot, chat_id):
         use_independent_chat_permissions=True,
     )
     db.clear_common_lock()
+
+# ============================================================
+# Member access / private invite links
+# ============================================================
+
+MEMBER_GROUPS = ("telegram", "instagram", "tiktok", "common")
+
+
+async def create_private_member_links(bot, user_id):
+    """إنشاء روابط طلب انضمام خاصة بالعضو المضاف."""
+    links = []
+
+    for platform in MEMBER_GROUPS:
+        group = db.get_group(platform)
+        if not group:
+            continue
+
+        try:
+            invite = await bot.create_chat_invite_link(
+                chat_id=group["chat_id"],
+                name=f"member-{user_id}",
+                creates_join_request=True,
+                expire_date=int(datetime.now(timezone.utc).timestamp()) + 86400,
+            )
+            db.add_member_invite(
+                user_id,
+                platform,
+                group["chat_id"],
+                invite.invite_link,
+            )
+            links.append((platform, invite.invite_link))
+        except TelegramError:
+            # لا نسجل الخطأ في قاعدة البيانات؛ الهدف تقليل الحمل.
+            continue
+
+    return links
+
+
+async def kick_member_from_all_groups(bot, user_id):
+    """طرد العضو من كل أقسام التيم، بما فيها الكروب العام."""
+    for platform in MEMBER_GROUPS:
+        group = db.get_group(platform)
+        if not group:
+            continue
+
+        chat_id = group["chat_id"]
+        try:
+            # ban ثم unban = طرد العضو مع إبقائه قادرًا على العودة
+            # فقط عبر رابط جديد يصدره البوت.
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        except TelegramError:
+            continue
+
+
+async def member_join_request(update, context):
+    """قبول طلب الانضمام فقط إذا كان رابط الدعوة صادرًا لنفس العضو."""
+    req = update.chat_join_request
+    if not req:
+        return
+
+    invite_link = req.invite_link.invite_link if req.invite_link else None
+    if not invite_link:
+        await req.decline()
+        return
+
+    row = db.get_member_invite(req.chat.id, invite_link)
+
+    if not row or int(row["user_id"]) != int(req.from_user.id):
+        try:
+            await req.decline()
+        except TelegramError:
+            pass
+        return
+
+    try:
+        await req.approve()
+        db.finish_member_invite(row["id"])
+        try:
+            await context.bot.revoke_chat_invite_link(
+                req.chat.id,
+                invite_link,
+            )
+        except TelegramError:
+            pass
+    except TelegramError:
+        pass
+
 
 # ============================================================
 # Platform workflows
@@ -2944,28 +3071,72 @@ async def founder_text_router(update, context):
 
             uid = int(uid_s)
 
+            if uid == FOUNDER_ID:
+                raise ValueError
+
             db.add_user(
                 uid,
                 None,
                 name,
                 "member",
             )
+            db.cancel_member_invites(uid)
+
+            links = await create_private_member_links(
+                context.bot,
+                uid,
+            )
 
             db.clear_session(user_id)
 
+            if links:
+                lines = ["تمت إضافة العضو.", "", "روابط الدخول الخاصة به:"]
+                for platform, link in links:
+                    lines.append(f"{PLATFORM_LABELS.get(platform, 'الكروب العام')}: {link}")
+                lines.append("")
+                lines.append("هذه الروابط تعمل للعضو المحدد فقط، ويفضل إرسالها له مباشرة.")
+                text_out = "\n".join(lines)
+            else:
+                text_out = (
+                    "تمت إضافة العضو، لكن لم يتم إنشاء روابط دخول. "
+                    "تأكد من ضبط الكروبات ومنح البوت صلاحية دعوة الأعضاء."
+                )
+
             await update.message.reply_text(
-                "تمت إضافة العضو.",
+                text_out,
                 reply_markup=founder_keyboard(),
             )
+
+            # إرسال الروابط أيضًا في رسالة منفصلة للعضو إذا كان قد بدأ البوت.
+            if links:
+                try:
+                    lines = ["تمت إضافتك إلى التيم.", "", "روابط الدخول الخاصة بك:"]
+                    for platform, link in links:
+                        lines.append(f"{PLATFORM_LABELS.get(platform, 'الكروب العام')}: {link}")
+                    lines.append("")
+                    lines.append("لا تشارك هذه الروابط مع أي شخص آخر.")
+                    await context.bot.send_message(
+                        uid,
+                        "\n".join(lines),
+                    )
+                except TelegramError:
+                    pass
 
             return True
 
         if state == "FOUNDER_REMOVE_USER":
-            db.remove_user(int(text))
+            uid = int(text)
+            if uid == FOUNDER_ID:
+                raise ValueError
+
+            db.remove_user(uid)
+            db.cancel_member_invites(uid)
+            await kick_member_from_all_groups(context.bot, uid)
+
             db.clear_session(user_id)
 
             await update.message.reply_text(
-                "تم حذف العضو.",
+                "تم حذف العضو وطرده من جميع أقسام التيم.",
                 reply_markup=founder_keyboard(),
             )
 
@@ -3267,6 +3438,12 @@ def build_app():
             & (filters.PHOTO | filters.VIDEO)
             & ~filters.COMMAND,
             founder_welcome_media_router,
+        )
+    )
+
+    app.add_handler(
+        ChatJoinRequestHandler(
+            member_join_request,
         )
     )
 

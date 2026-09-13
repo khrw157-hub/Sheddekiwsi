@@ -10,6 +10,7 @@ import logging
 import sqlite3
 import base64
 import gzip
+import asyncio
 from io import BytesIO
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -25,7 +26,6 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ChatJoinRequestHandler,
     filters,
 )
 from telegram.error import TelegramError
@@ -83,6 +83,8 @@ APPLY_QUESTIONS = {
 }
 
 DEPARTMENT_OPTIONS = {
+    "programming": "البرمجة",
+    "band": "الباند",
     "instagram": "انستقرام",
     "telegram": "تيليجرام",
     "both": "كلاهما",
@@ -227,21 +229,66 @@ class Database:
                 updated_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS member_invites (
+            CREATE TABLE IF NOT EXISTS admin_platforms (
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, platform),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS announcements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                department TEXT,
+                platform TEXT,
+                text TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS meetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                meeting_time TEXT NOT NULL,
+                details TEXT,
+                audience TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'SCHEDULED'
+            );
+
+            CREATE TABLE IF NOT EXISTS templates (
+                key TEXT PRIMARY KEY,
+                text TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS member_invites (
+                invite_link TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 platform TEXT NOT NULL,
                 chat_id INTEGER NOT NULL,
-                invite_link TEXT NOT NULL UNIQUE,
-                status TEXT NOT NULL DEFAULT 'PENDING',
+                active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                used_at TEXT
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_member_invites_lookup
-            ON member_invites(chat_id, invite_link, status);
-            CREATE INDEX IF NOT EXISTS idx_member_invites_user
-            ON member_invites(user_id, status);
+
+            CREATE TABLE IF NOT EXISTS user_platforms (
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(user_id, platform),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
             """)
+
+            # ترقية آمنة لقاعدة البيانات القديمة دون حذف أي إعدادات.
+            cols = {r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()}
+            if "department" not in cols:
+                con.execute("ALTER TABLE users ADD COLUMN department TEXT")
 
             for platform in PLATFORMS:
                 con.execute(
@@ -249,9 +296,25 @@ class Database:
                     (platform,),
                 )
 
+            # نقل صلاحيات admins القديمة إلى الجدول الجديد متعدد الصلاحيات.
+            old_admins = con.execute("SELECT user_id, platform, active, created_at FROM admins").fetchall()
+            for a in old_admins:
+                con.execute(
+                    "INSERT OR IGNORE INTO admin_platforms(user_id, platform, active, created_at) VALUES(?,?,?,?)",
+                    (a[0], a[1], a[2], a[3]),
+                )
+
+            defaults = {
+                "template_shd_start": "نزل شد جديد على {platform}.\nتوجهوا إلى قسم {platform} وشاركوا في الشدة.",
+                "template_shd_finish": "انتهى الشد وتم فتح الكروب العام.",
+                "template_meeting": "اجتماع جديد\nالعنوان: {title}\nالوقت: {time}\n{details}",
+                "template_alert": "تنبيه من إدارة التيم:\n{text}",
+            }
+            for k, v in defaults.items():
+                con.execute("INSERT OR IGNORE INTO templates(key,text) VALUES(?,?)", (k,v))
+
     def log_event(self, level, event, user_id=None, request_id=None, details=None):
-        # السجلات معطلة لتخفيف الضغط على SQLite وRailway المجاني.
-        # تبقى دالة التوافق موجودة حتى لا تتأثر النسخة القديمة.
+        # متعمد: لا يتم تخزين Logs لتخفيف SQLite وRailway المجاني.
         return None
 
     def get_user(self, user_id):
@@ -271,7 +334,7 @@ class Database:
                 ON CONFLICT(user_id) DO UPDATE SET
                     username=excluded.username,
                     full_name=excluded.full_name,
-                    role=users.role,
+                    role=excluded.role,
                     active=1""",
                 (
                     user_id,
@@ -288,10 +351,10 @@ class Database:
                 "UPDATE users SET active=0 WHERE user_id=?",
                 (user_id,),
             )
-            con.execute(
-                "UPDATE admins SET active=0 WHERE user_id=?",
-                (user_id,),
-            )
+            con.execute("UPDATE admins SET active=0 WHERE user_id=?", (user_id,))
+            con.execute("UPDATE admin_platforms SET active=0 WHERE user_id=?", (user_id,))
+            con.execute("UPDATE member_invites SET active=0 WHERE user_id=?", (user_id,))
+            con.execute("UPDATE user_platforms SET active=0 WHERE user_id=?", (user_id,))
 
     def list_users(self):
         with self.conn() as con:
@@ -304,62 +367,135 @@ class Database:
     def add_admin(self, user_id, platform):
         with self.conn() as con:
             con.execute(
-                """INSERT INTO admins(
-                    user_id,platform,active,created_at
-                )
-                VALUES(?,?,1,?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    platform=excluded.platform,
-                    active=1""",
-                (
-                    user_id,
-                    platform,
-                    now_iso(),
-                ),
+                "INSERT OR IGNORE INTO admin_platforms(user_id,platform,active,created_at) VALUES(?,?,1,?)",
+                (user_id, platform, now_iso()),
+            )
+            con.execute(
+                "UPDATE admin_platforms SET active=1 WHERE user_id=? AND platform=?",
+                (user_id, platform),
             )
             con.execute(
                 "UPDATE users SET role='admin', active=1 WHERE user_id=?",
                 (user_id,),
             )
 
-    def remove_admin(self, user_id):
+    def remove_admin(self, user_id, platform=None):
         with self.conn() as con:
-            con.execute(
-                "UPDATE admins SET active=0 WHERE user_id=?",
-                (user_id,),
-            )
-            con.execute(
-                "UPDATE users SET role='member' WHERE user_id=? AND active=1",
-                (user_id,),
-            )
+            if platform:
+                con.execute("UPDATE admin_platforms SET active=0 WHERE user_id=? AND platform=?", (user_id, platform))
+            else:
+                con.execute("UPDATE admin_platforms SET active=0 WHERE user_id=?", (user_id,))
+            remaining = con.execute("SELECT 1 FROM admin_platforms WHERE user_id=? AND active=1 LIMIT 1", (user_id,)).fetchone()
+            if not remaining:
+                con.execute("UPDATE users SET role='member' WHERE user_id=? AND active=1", (user_id,))
 
     def get_admin(self, user_id, platform=None):
         with self.conn() as con:
             if platform:
                 return con.execute(
-                    """SELECT * FROM admins
-                       WHERE user_id=? AND platform=? AND active=1""",
-                    (
-                        user_id,
-                        platform,
-                    ),
+                    "SELECT * FROM admin_platforms WHERE user_id=? AND platform=? AND active=1",
+                    (user_id, platform),
                 ).fetchone()
-
             return con.execute(
-                """SELECT * FROM admins
-                   WHERE user_id=? AND active=1""",
+                "SELECT * FROM admin_platforms WHERE user_id=? AND active=1 LIMIT 1",
                 (user_id,),
             ).fetchone()
 
     def list_admins(self):
         with self.conn() as con:
             return con.execute(
-                """SELECT a.*, u.username, u.full_name
-                   FROM admins a
-                   JOIN users u ON u.user_id=a.user_id
-                   WHERE a.active=1
-                   ORDER BY a.platform, a.created_at DESC"""
+                """SELECT a.user_id, a.platform, a.active, a.created_at, u.username, u.full_name
+                   FROM admin_platforms a JOIN users u ON u.user_id=a.user_id
+                   WHERE a.active=1 ORDER BY a.user_id, a.platform"""
             ).fetchall()
+
+    def add_member_invite(self, invite_link, user_id, platform, chat_id):
+        with self.conn() as con:
+            con.execute("INSERT OR REPLACE INTO member_invites(invite_link,user_id,platform,chat_id,active,created_at) VALUES(?,?,?,?,1,?)", (invite_link,user_id,platform,chat_id,now_iso()))
+
+    def get_member_invite(self, invite_link):
+        with self.conn() as con:
+            return con.execute("SELECT * FROM member_invites WHERE invite_link=? AND active=1", (invite_link,)).fetchone()
+
+    def deactivate_member_invite(self, invite_link):
+        with self.conn() as con:
+            con.execute("UPDATE member_invites SET active=0 WHERE invite_link=?", (invite_link,))
+
+    def deactivate_user_invites(self, user_id):
+        with self.conn() as con:
+            con.execute("UPDATE member_invites SET active=0 WHERE user_id=?", (user_id,))
+
+    def add_user_platform(self, user_id, platform):
+        with self.conn() as con:
+            con.execute("INSERT INTO user_platforms(user_id,platform,active) VALUES(?,?,1) ON CONFLICT(user_id,platform) DO UPDATE SET active=1", (user_id,platform))
+
+    def get_platform_members(self, platform):
+        with self.conn() as con:
+            return con.execute("SELECT user_id FROM user_platforms WHERE platform=? AND active=1", (platform,)).fetchall()
+
+    def set_department(self, user_id, department):
+        with self.conn() as con:
+            con.execute("UPDATE users SET department=? WHERE user_id=?", (department, user_id))
+
+    def get_template(self, key, default=""):
+        with self.conn() as con:
+            row=con.execute("SELECT text FROM templates WHERE key=?", (key,)).fetchone()
+            return row["text"] if row else default
+
+    def set_template(self, key, value):
+        with self.conn() as con:
+            con.execute("INSERT INTO templates(key,text) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET text=excluded.text", (key,value))
+
+    def create_announcement(self, kind, audience, text, created_by, department=None, platform=None):
+        with self.conn() as con:
+            cur=con.execute("INSERT INTO announcements(kind,audience,department,platform,text,created_by,created_at) VALUES(?,?,?,?,?,?,?)", (kind,audience,department,platform,text,created_by,now_iso()))
+            return cur.lastrowid
+
+    def update_announcement_count(self, ann_id, count):
+        with self.conn() as con:
+            con.execute("UPDATE announcements SET sent_count=? WHERE id=?", (count,ann_id))
+
+    def list_announcements(self, limit=20):
+        with self.conn() as con:
+            return con.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def create_meeting(self, title, meeting_time, details, audience, created_by):
+        with self.conn() as con:
+            cur=con.execute("INSERT INTO meetings(title,meeting_time,details,audience,created_by,created_at) VALUES(?,?,?,?,?,?)", (title,meeting_time,details,audience,created_by,now_iso()))
+            return cur.lastrowid
+
+    def get_meeting(self, meeting_id):
+        with self.conn() as con:
+            return con.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
+
+    def list_meetings(self, limit=20):
+        with self.conn() as con:
+            return con.execute("SELECT * FROM meetings ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def get_recipients(self, audience, department=None, platform=None):
+        with self.conn() as con:
+            if audience == "all":
+                return con.execute("SELECT user_id FROM users WHERE active=1").fetchall()
+            if audience == "department":
+                return con.execute("SELECT user_id FROM users WHERE active=1 AND department=?", (department,)).fetchall()
+            if audience == "platform":
+                return con.execute("SELECT user_id FROM user_platforms WHERE active=1 AND platform=?", (platform,)).fetchall()
+            return []
+
+    def count_active_users(self):
+        with self.conn() as con:
+            return con.execute("SELECT COUNT(*) n FROM users WHERE active=1").fetchone()["n"]
+
+    def count_active_admins(self):
+        with self.conn() as con:
+            return con.execute("SELECT COUNT(DISTINCT user_id) n FROM admin_platforms WHERE active=1").fetchone()["n"]
+
+    def application_stats(self):
+        with self.conn() as con:
+            return con.execute("SELECT status, COUNT(*) n FROM applications GROUP BY status").fetchall()
+
+    def remove_user_everywhere_data(self, user_id):
+        self.remove_user(user_id)
 
     def set_group(self, platform, chat_id):
         with self.conn() as con:
@@ -597,43 +733,6 @@ class Database:
                 (user_id,),
             )
 
-    # -------------------- Member invite links --------------------
-
-    def add_member_invite(self, user_id, platform, chat_id, invite_link):
-        with self.conn() as con:
-            con.execute(
-                """INSERT INTO member_invites(
-                    user_id,platform,chat_id,invite_link,status,created_at
-                ) VALUES(?,?,?,?,?,?)""",
-                (user_id, platform, chat_id, invite_link, "PENDING", now_iso()),
-            )
-
-    def get_member_invite(self, chat_id, invite_link):
-        with self.conn() as con:
-            return con.execute(
-                """SELECT * FROM member_invites
-                   WHERE chat_id=? AND invite_link=? AND status='PENDING'
-                   ORDER BY id DESC LIMIT 1""",
-                (chat_id, invite_link),
-            ).fetchone()
-
-    def finish_member_invite(self, invite_id):
-        with self.conn() as con:
-            con.execute(
-                """UPDATE member_invites
-                   SET status='USED', used_at=?
-                   WHERE id=? AND status='PENDING'""",
-                (now_iso(), invite_id),
-            )
-
-    def cancel_member_invites(self, user_id):
-        with self.conn() as con:
-            con.execute(
-                """UPDATE member_invites SET status='CANCELLED'
-                   WHERE user_id=? AND status='PENDING'""",
-                (user_id,),
-            )
-
     # -------------------- Settings (key/value) --------------------
 
     def get_setting(self, key, default=None):
@@ -735,7 +834,7 @@ class Database:
             ]
             admins = [
                 dict(r) for r in con.execute(
-                    "SELECT user_id,platform FROM admins WHERE active=1"
+                    "SELECT user_id,platform FROM admin_platforms WHERE active=1"
                 )
             ]
             groups = [
@@ -753,15 +852,21 @@ class Database:
                     "SELECT key,value FROM settings"
                 )
             ]
+            templates = [dict(r) for r in con.execute("SELECT key,text FROM templates")]
+            announcements = [dict(r) for r in con.execute("SELECT kind,audience,department,platform,text,created_by,sent_count,created_at FROM announcements ORDER BY id DESC LIMIT 30")]
+            user_platforms = [dict(r) for r in con.execute("SELECT user_id,platform,active FROM user_platforms WHERE active=1")]
 
         return {
-            "version": 1,
+            "version": 2,
             "exported_at": now_iso(),
             "users": users,
             "admins": admins,
             "groups": groups,
             "platforms": platforms,
             "settings": settings,
+            "templates": templates,
+            "announcements": announcements,
+            "user_platforms": user_platforms,
         }
 
     def import_config(self, data):
@@ -789,18 +894,16 @@ class Database:
                         now_iso(),
                     ),
                 )
+                if "department" in u:
+                    con.execute("UPDATE users SET department=? WHERE user_id=?", (u.get("department"), u["user_id"]))
 
             for a in data.get("admins", []):
                 if "user_id" not in a or "platform" not in a:
                     continue
                 con.execute(
-                    """INSERT INTO admins(
-                        user_id,platform,active,created_at
-                    )
-                    VALUES(?,?,1,?)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        platform=excluded.platform,
-                        active=1""",
+                    """INSERT INTO admin_platforms(user_id,platform,active,created_at)
+                       VALUES(?,?,1,?)
+                       ON CONFLICT(user_id,platform) DO UPDATE SET active=1""",
                     (
                         a["user_id"],
                         a["platform"],
@@ -851,6 +954,97 @@ class Database:
                         s.get("value"),
                     ),
                 )
+
+            for up in data.get("user_platforms", []):
+                if "user_id" in up and "platform" in up:
+                    con.execute("INSERT INTO user_platforms(user_id,platform,active) VALUES(?,?,1) ON CONFLICT(user_id,platform) DO UPDATE SET active=1", (up["user_id"], up["platform"]))
+
+
+# ============================================================
+# Lightweight team management helpers
+# ============================================================
+
+ANNOUNCEMENT_KINDS = {
+    "shd": "خبر شد",
+    "meeting": "اجتماع",
+    "alert": "تنبيه",
+    "general": "إعلان عام",
+    "department": "إعلان لقسم",
+}
+AUDIENCES = {
+    "all": "جميع التيم",
+    "department": "قسم",
+    "platform": "منصة",
+}
+TEAM_STATUS = {
+    "available": "متاح",
+    "shd": "يوجد شد",
+    "meeting": "اجتماع",
+    "emergency": "طوارئ",
+    "closed": "مغلق",
+}
+
+def get_team_status():
+    return db.get_setting("team_status", "available")
+
+def set_team_status(value):
+    if value in TEAM_STATUS:
+        db.set_setting("team_status", value)
+
+def feature_enabled(key, default="1"):
+    return db.get_setting(key, default) == "1"
+
+async def send_announcement(bot, kind, audience, text, created_by, department=None, platform=None):
+    ann_id=db.create_announcement(kind,audience,text,created_by,department,platform)
+    recipients=db.get_recipients(audience,department,platform)
+    sent=0
+    for row in recipients:
+        try:
+            await bot.send_message(row["user_id"], text)
+            sent += 1
+        except TelegramError:
+            pass
+    db.update_announcement_count(ann_id,sent)
+    return ann_id,sent
+
+async def notify_shd(bot, platform, started=True):
+    if not feature_enabled("shd_notifications", "1"):
+        return
+    label=PLATFORM_LABELS.get(platform,platform)
+    if started:
+        text=db.get_template("template_shd_start", "نزل شد جديد على {platform}.\nتوجهوا إلى قسم {platform} وشاركوا في الشدة.").format(platform=label)
+        await send_announcement(bot,"shd","all",text,FOUNDER_ID)
+    else:
+        text=db.get_template("template_shd_finish", "انتهى الشد وتم فتح الكروب العام.")
+        await send_announcement(bot,"shd","all",text,FOUNDER_ID)
+
+async def schedule_meeting_reminders(bot, meeting_id):
+    meeting=db.get_meeting(meeting_id)
+    if not meeting:
+        return
+    try:
+        dt=datetime.fromisoformat(meeting["meeting_time"])
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return
+    now=datetime.now(timezone.utc)
+    for minutes in (60,10):
+        delay=(dt-now).total_seconds()-minutes*60
+        if delay <= 0:
+            continue
+        async def reminder(delay_seconds=delay, mins=minutes):
+            await asyncio.sleep(delay_seconds)
+            m=db.get_meeting(meeting_id)
+            if not m or m["status"] != "SCHEDULED":
+                return
+            audience=m["audience"]
+            text=f"تذكير باجتماع التيم\nالعنوان: {m['title']}\nالوقت: {m['meeting_time']}\nمتبقي: {mins} دقيقة"
+            if m["details"]:
+                text += "\n" + m["details"]
+            await send_announcement(bot,"meeting",audience,text,FOUNDER_ID)
+        asyncio.create_task(reminder())
+
 
 
 db = Database(DB_PATH)
@@ -909,43 +1103,50 @@ def finish_keyboard(request_id):
 
 def founder_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "إدارة الأعضاء",
-            callback_data="founder:users",
-        )],
-        [InlineKeyboardButton(
-            "إدارة المشرفين",
-            callback_data="founder:admins",
-        )],
-        [InlineKeyboardButton(
-            "إدارة المنصات",
-            callback_data="founder:platforms",
-        )],
-        [InlineKeyboardButton(
-            "إدارة الكروبات",
-            callback_data="founder:groups",
-        )],
-        [InlineKeyboardButton(
-            "إعدادات التقديم",
-            callback_data="founder:apply",
-        )],
-        [InlineKeyboardButton(
-            "نسخ احتياطي للإعدادات",
-            callback_data="founder:backup",
-        )],
-        [InlineKeyboardButton(
-            "الطلبات",
-            callback_data="founder:requests",
-        )],
-        [InlineKeyboardButton(
-            "الإحصائيات",
-            callback_data="founder:stats",
-        )],
-        [InlineKeyboardButton(
-            "الإعدادات",
-            callback_data="founder:settings",
-        )],
+        [InlineKeyboardButton("إدارة التيم", callback_data="founder:team"), InlineKeyboardButton("إدارة الشد", callback_data="founder:shd")],
+        [InlineKeyboardButton("الإعلانات", callback_data="founder:announcements"), InlineKeyboardButton("الاجتماعات", callback_data="founder:meetings")],
+        [InlineKeyboardButton("التقديم", callback_data="founder:apply_menu"), InlineKeyboardButton("الكروبات", callback_data="founder:groups")],
+        [InlineKeyboardButton("الإحصائيات", callback_data="founder:stats"), InlineKeyboardButton("الإعدادات", callback_data="founder:settings")],
+        [InlineKeyboardButton("النسخ الاحتياطي", callback_data="founder:backup")],
     ])
+
+def team_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("الأعضاء", callback_data="f:team_users"), InlineKeyboardButton("المشرفون والصلاحيات", callback_data="f:team_admins")],
+        [InlineKeyboardButton("حالة التيم", callback_data="f:team_status")],
+        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+    ])
+
+def status_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("متاح", callback_data="f:status:available"), InlineKeyboardButton("يوجد شد", callback_data="f:status:shd")],
+        [InlineKeyboardButton("اجتماع", callback_data="f:status:meeting"), InlineKeyboardButton("طوارئ", callback_data="f:status:emergency")],
+        [InlineKeyboardButton("مغلق", callback_data="f:status:closed")],
+        [InlineKeyboardButton("رجوع", callback_data="founder:team")],
+    ])
+
+def announcements_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("إعلان جديد", callback_data="f:ann_new")],
+        [InlineKeyboardButton("الإعلانات المرسلة", callback_data="f:ann_list")],
+        [InlineKeyboardButton("القوالب", callback_data="f:templates")],
+        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+    ])
+
+def meetings_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("اجتماع جديد", callback_data="f:meeting_new")],
+        [InlineKeyboardButton("الاجتماعات", callback_data="f:meeting_list")],
+        [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+    ])
+
+def announcement_kind_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"f:ann_kind:{k}")] for k,v in ANNOUNCEMENT_KINDS.items()] + [[InlineKeyboardButton("إلغاء", callback_data="founder:announcements")]])
+
+def audience_keyboard(kind):
+    rows=[[InlineKeyboardButton("جميع التيم", callback_data=f"f:ann_aud:{kind}:all")],[InlineKeyboardButton("البرمجة", callback_data=f"f:ann_aud:{kind}:dept:programming"), InlineKeyboardButton("الباند", callback_data=f"f:ann_aud:{kind}:dept:band")],[InlineKeyboardButton("Telegram", callback_data=f"f:ann_aud:{kind}:platform:telegram"), InlineKeyboardButton("Instagram", callback_data=f"f:ann_aud:{kind}:platform:instagram"), InlineKeyboardButton("TikTok", callback_data=f"f:ann_aud:{kind}:platform:tiktok")]]
+    rows.append([InlineKeyboardButton("رجوع", callback_data="founder:announcements")])
+    return InlineKeyboardMarkup(rows)
 
 
 def founder_users_keyboard():
@@ -958,10 +1159,9 @@ def founder_users_keyboard():
             "حذف عضو",
             callback_data="f:remove_user",
         )],
-        [InlineKeyboardButton(
-            "قائمة الأعضاء",
-            callback_data="f:list_users",
-        )],
+        [InlineKeyboardButton("قائمة الأعضاء", callback_data="f:list_users")],
+        [InlineKeyboardButton("رابط دخول عضو", callback_data="f:member_link")],
+        [InlineKeyboardButton("تعيين قسم لعضو", callback_data="f:set_department")],
         [InlineKeyboardButton(
             "رجوع",
             callback_data="founder:home",
@@ -1272,94 +1472,6 @@ async def unlock_common_group(bot, chat_id):
     db.clear_common_lock()
 
 # ============================================================
-# Member access / private invite links
-# ============================================================
-
-MEMBER_GROUPS = ("telegram", "instagram", "tiktok", "common")
-
-
-async def create_private_member_links(bot, user_id):
-    """إنشاء روابط طلب انضمام خاصة بالعضو المضاف."""
-    links = []
-
-    for platform in MEMBER_GROUPS:
-        group = db.get_group(platform)
-        if not group:
-            continue
-
-        try:
-            invite = await bot.create_chat_invite_link(
-                chat_id=group["chat_id"],
-                name=f"member-{user_id}",
-                creates_join_request=True,
-                expire_date=int(datetime.now(timezone.utc).timestamp()) + 86400,
-            )
-            db.add_member_invite(
-                user_id,
-                platform,
-                group["chat_id"],
-                invite.invite_link,
-            )
-            links.append((platform, invite.invite_link))
-        except TelegramError:
-            # لا نسجل الخطأ في قاعدة البيانات؛ الهدف تقليل الحمل.
-            continue
-
-    return links
-
-
-async def kick_member_from_all_groups(bot, user_id):
-    """طرد العضو من كل أقسام التيم، بما فيها الكروب العام."""
-    for platform in MEMBER_GROUPS:
-        group = db.get_group(platform)
-        if not group:
-            continue
-
-        chat_id = group["chat_id"]
-        try:
-            # ban ثم unban = طرد العضو مع إبقائه قادرًا على العودة
-            # فقط عبر رابط جديد يصدره البوت.
-            await bot.ban_chat_member(chat_id, user_id)
-            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        except TelegramError:
-            continue
-
-
-async def member_join_request(update, context):
-    """قبول طلب الانضمام فقط إذا كان رابط الدعوة صادرًا لنفس العضو."""
-    req = update.chat_join_request
-    if not req:
-        return
-
-    invite_link = req.invite_link.invite_link if req.invite_link else None
-    if not invite_link:
-        await req.decline()
-        return
-
-    row = db.get_member_invite(req.chat.id, invite_link)
-
-    if not row or int(row["user_id"]) != int(req.from_user.id):
-        try:
-            await req.decline()
-        except TelegramError:
-            pass
-        return
-
-    try:
-        await req.approve()
-        db.finish_member_invite(row["id"])
-        try:
-            await context.bot.revoke_chat_invite_link(
-                req.chat.id,
-                invite_link,
-            )
-        except TelegramError:
-            pass
-    except TelegramError:
-        pass
-
-
-# ============================================================
 # Platform workflows
 # ============================================================
 
@@ -1528,6 +1640,7 @@ async def platform_callback(update, context):
     platform = query.data.split(":", 1)[1]
 
     db.clear_session(user_id)
+    db.add_user_platform(user_id, platform)
 
     if platform == "telegram":
         message, keyboard = await start_telegram(user_id)
@@ -1865,6 +1978,8 @@ async def approve_callback(update, context):
             request["user_id"],
             "تمت الموافقة على شدتك وتم نزولها.",
         )
+        set_team_status("shd")
+        await notify_shd(context.bot, request["platform"], True)
 
     except TelegramError as exc:
         db.set_request_status(
@@ -2039,6 +2154,8 @@ async def finish_callback(update, context):
         request["user_id"],
         "انتهى الشد.",
     )
+    set_team_status("available")
+    await notify_shd(context.bot, request["platform"], False)
 
     if request["group_message_id"]:
         try:
@@ -2188,21 +2305,16 @@ async def finalize_application(bot, user_id, data):
     )
 
 
-async def make_invite_link(bot, chat_id):
+async def make_member_invite(bot, chat_id, user_id, platform):
     try:
         invite = await bot.create_chat_invite_link(
             chat_id,
-            member_limit=1,
+            creates_join_request=True,
+            name=f"member-{user_id}-{platform}",
         )
+        db.add_member_invite(invite.invite_link, user_id, platform, chat_id)
         return invite.invite_link
-    except TelegramError as exc:
-        db.log_event(
-            "ERROR",
-            "invite_link_failed",
-            None,
-            None,
-            str(exc),
-        )
+    except TelegramError:
         return None
 
 
@@ -2398,11 +2510,17 @@ async def application_approve_callback(update, context):
     department = app_row["department"]
     target_platforms = []
 
-    if department in ("instagram", "both"):
+    if department == "programming":
+        db.set_department(app_row["user_id"], "programming")
+        target_platforms = list(PLATFORMS)
+    elif department == "band":
+        db.set_department(app_row["user_id"], "band")
+        target_platforms = list(PLATFORMS)
+    elif department in ("instagram", "both"):
         target_platforms.append("instagram")
     if department in ("telegram", "both"):
         target_platforms.append("telegram")
-    if department not in ("instagram", "telegram", "both"):
+    if not target_platforms:
         target_platforms = list(PLATFORMS)
 
     links = []
@@ -2411,13 +2529,13 @@ async def application_approve_callback(update, context):
         group = db.get_group(platform)
         if not group:
             continue
-        link = await make_invite_link(context.bot, group["chat_id"])
+        link = await make_member_invite(context.bot, group["chat_id"], app_row["user_id"], platform)
         if link:
             links.append(f"كروب {platform}: {link}")
 
     common = db.get_group("common")
     if common:
-        link = await make_invite_link(context.bot, common["chat_id"])
+        link = await make_member_invite(context.bot, common["chat_id"], app_row["user_id"], COMMON_PLATFORM)
         if link:
             links.append(f"الكروب العام: {link}")
 
@@ -2735,6 +2853,42 @@ def is_founder(user_id):
     return user_id == FOUNDER_ID
 
 
+async def kick_member_from_all_groups(bot, user_id):
+    removed=0
+    for platform in (*PLATFORMS, COMMON_PLATFORM):
+        group=db.get_group(platform)
+        if not group:
+            continue
+        try:
+            await bot.ban_chat_member(group["chat_id"], user_id)
+            try:
+                await bot.unban_chat_member(group["chat_id"], user_id, only_if_banned=True)
+            except TelegramError:
+                pass
+            removed += 1
+        except TelegramError:
+            pass
+    return removed
+
+async def member_join_request(update, context):
+    req=update.chat_join_request
+    if not req:
+        return
+    invite=db.get_member_invite(req.invite_link.invite_link if req.invite_link else "")
+    if not invite or not invite["active"] or invite["user_id"] != req.from_user.id or invite["chat_id"] != req.chat.id:
+        try:
+            await context.bot.decline_chat_join_request(req.chat.id, req.from_user.id)
+        except TelegramError:
+            pass
+        return
+    try:
+        await context.bot.approve_chat_join_request(req.chat.id, req.from_user.id)
+        db.deactivate_member_invite(invite["invite_link"])
+        if invite["platform"] != COMMON_PLATFORM:
+            db.add_user_platform(req.from_user.id, invite["platform"])
+    except TelegramError:
+        pass
+
 async def start(update, context):
     if update.effective_chat and update.effective_chat.type != "private":
         return
@@ -2752,8 +2906,9 @@ async def start(update, context):
         )
         return
 
+    status=TEAM_STATUS.get(get_team_status(), "متاح")
     await update.message.reply_text(
-        "اختر المنصة.",
+        f"حالة التيم: {status}\n\nاختر المنصة.",
         reply_markup=main_keyboard(),
     )
 
@@ -2771,6 +2926,26 @@ async def founder_callback(update, context):
     await query.answer()
 
     key = query.data
+
+    if key == "founder:team":
+        await query.edit_message_text("إدارة التيم", reply_markup=team_keyboard())
+        return
+
+    if key == "founder:shd":
+        await query.edit_message_text("إدارة الشد", reply_markup=founder_platforms_keyboard())
+        return
+
+    if key == "founder:announcements":
+        await query.edit_message_text("مركز الإعلانات", reply_markup=announcements_keyboard())
+        return
+
+    if key == "founder:meetings":
+        await query.edit_message_text("نظام الاجتماعات", reply_markup=meetings_keyboard())
+        return
+
+    if key == "founder:apply_menu":
+        await founder_apply_menu_callback_entry(query)
+        return
 
     if key == "founder:home":
         await query.edit_message_text(
@@ -2843,11 +3018,44 @@ async def founder_callback(update, context):
         )
 
     elif key == "founder:settings":
+        status=TEAM_STATUS.get(get_team_status(), "متاح")
         await query.edit_message_text(
-            "الإعدادات الحالية محفوظة في Environment Variables وقاعدة البيانات.",
-            reply_markup=founder_keyboard(),
+            "الإعدادات\n\n"
+            f"حالة التيم: {status}\n"
+            f"تنبيهات الشد: {'مفعلة' if feature_enabled('shd_notifications') else 'متوقفة'}\n"
+            "لا يتم حفظ Logs في قاعدة البيانات.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("تشغيل تنبيهات الشد", callback_data="f:toggle:shd:1"), InlineKeyboardButton("إيقاف تنبيهات الشد", callback_data="f:toggle:shd:0")],
+                [InlineKeyboardButton("رجوع", callback_data="founder:home")],
+            ]),
         )
 
+
+async def feature_callback(update, context):
+    query=update.callback_query
+    if not is_founder(query.from_user.id):
+        await query.answer("لا تملك صلاحية الإدارة.", show_alert=True); return
+    await query.answer()
+    parts=query.data.split(":")
+    action=parts[1]
+    if action=="toggle":
+        if len(parts) >= 4 and parts[2]=="shd":
+            db.set_setting("shd_notifications", parts[3])
+        await query.edit_message_text("تم تحديث إعداد التنبيهات.", reply_markup=founder_keyboard()); return
+    if action=="status":
+        set_team_status(parts[2]); await query.edit_message_text(f"تم تغيير حالة التيم إلى: {TEAM_STATUS[parts[2]]}", reply_markup=status_keyboard()); return
+    if action=="ann_kind":
+        kind=parts[2]; await query.edit_message_text("اختر الجمهور:", reply_markup=audience_keyboard(kind)); return
+    if action=="ann_aud":
+        kind=parts[2]; typ=parts[3]; val=parts[4] if len(parts)>4 else None
+        audience="all" if typ=="all" else ("department" if typ=="dept" else "platform")
+        data={"kind":kind,"audience":audience,"department":val if typ=="dept" else None,"platform":val if typ=="platform" else None}
+        db.set_session(query.from_user.id,"FOUNDER_ANN_TEXT",data)
+        await query.edit_message_text("أرسل نص الإعلان الآن.", reply_markup=cancel_keyboard()); return
+    if action=="template":
+        key=parts[2]
+        db.set_session(query.from_user.id,"FOUNDER_TEMPLATE_"+key,{})
+        await query.edit_message_text("أرسل نص القالب الجديد. المتغيرات المتاحة تعتمد على القالب."); return
 
 async def founder_action_callback(update, context):
     query = update.callback_query
@@ -2875,9 +3083,10 @@ async def founder_action_callback(update, context):
             "أرسل ID المشرف ثم المنصة بهذا الشكل:\n"
             "123456789 | telegram"
         ),
-        "remove_admin": (
-            "أرسل ID المشرف المراد حذفه."
-        ),
+        "remove_admin": ("أرسل ID المشرف ثم المنصة بهذا الشكل:\n123456789 | telegram"),
+        "member_link": ("أرسل ID العضو لإصدار روابط دخول خاصة له."),
+        "set_department": ("أرسل ID العضو ثم القسم: programming أو band"),
+        "meeting_new": ("أرسل بيانات الاجتماع بهذا الشكل:\nالعنوان | 2026-09-13T20:00:00+03:00 | التفاصيل | all\nالجمهور: all أو programming أو band أو telegram أو instagram أو tiktok"),
     }
 
     if action in prompts:
@@ -2890,6 +3099,60 @@ async def founder_action_callback(update, context):
         await query.edit_message_text(
             prompts[action]
         )
+        return
+
+    if action == "team_users":
+        rows=db.list_users()
+        text="الأعضاء:\n\n"+"\n".join(f"{r['user_id']} | {r['full_name']} | {r['department'] or 'غير محدد'} | {r['role']}" for r in rows)
+        await query.edit_message_text(text or "لا يوجد أعضاء.", reply_markup=team_keyboard())
+        return
+
+    if action == "team_admins":
+        rows=db.list_admins()
+        text="المشرفون والصلاحيات:\n\n"+"\n".join(f"{r['user_id']} | {r['full_name']} | {r['platform']}" for r in rows)
+        await query.edit_message_text(text or "لا يوجد مشرفون.", reply_markup=team_keyboard())
+        return
+
+    if action == "team_status":
+        await query.edit_message_text(f"حالة التيم الحالية: {TEAM_STATUS.get(get_team_status(),'متاح')}", reply_markup=status_keyboard())
+        return
+
+    if action == "status":
+        return
+
+    if action == "member_link":
+        db.set_session(user_id,"FOUNDER_MEMBER_LINK",{})
+        await query.edit_message_text("أرسل ID العضو لإصدار روابط الدخول.")
+        return
+
+    if action == "set_department":
+        db.set_session(user_id,"FOUNDER_SET_DEPARTMENT",{})
+        await query.edit_message_text("أرسل ID العضو ثم القسم: programming أو band")
+        return
+
+    if action == "ann_new":
+        await query.edit_message_text("اختر نوع الإعلان:", reply_markup=announcement_kind_keyboard())
+        return
+
+    if action == "ann_list":
+        rows=db.list_announcements()
+        text="الإعلانات المرسلة:\n\n"+"\n".join(f"#{r['id']} | {ANNOUNCEMENT_KINDS.get(r['kind'],r['kind'])} | {r['sent_count']} مستلم | {r['created_at']}\n{r['text'][:120]}" for r in rows)
+        await query.edit_message_text(text or "لا توجد إعلانات.", reply_markup=announcements_keyboard())
+        return
+
+    if action == "templates":
+        await query.edit_message_text("قوالب الإعلانات", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("تعديل قالب نزول شد",callback_data="f:template:shd_start")],[InlineKeyboardButton("تعديل قالب انتهاء شد",callback_data="f:template:shd_finish")],[InlineKeyboardButton("تعديل قالب اجتماع",callback_data="f:template:meeting")],[InlineKeyboardButton("تعديل قالب تنبيه",callback_data="f:template:alert")],[InlineKeyboardButton("رجوع",callback_data="founder:announcements")]]))
+        return
+
+    if action == "meeting_new":
+        db.set_session(user_id,"FOUNDER_MEETING_NEW",{})
+        await query.edit_message_text(prompts["meeting_new"])
+        return
+
+    if action == "meeting_list":
+        rows=db.list_meetings()
+        text="الاجتماعات:\n\n"+"\n".join(f"#{r['id']} | {r['title']} | {r['meeting_time']} | {r['audience']}" for r in rows)
+        await query.edit_message_text(text or "لا توجد اجتماعات.", reply_markup=meetings_keyboard())
         return
 
     if action == "list_users":
@@ -3062,6 +3325,47 @@ async def founder_text_router(update, context):
         await apply_config_code(context.bot, user_id, text)
         return True
 
+    if state == "FOUNDER_ANN_TEXT":
+        data=session[1]; await send_announcement(context.bot,data["kind"],data["audience"],text,user_id,data.get("department"),data.get("platform")); db.clear_session(user_id); await update.message.reply_text("تم إرسال الإعلان.",reply_markup=announcements_keyboard()); return True
+
+    if state == "FOUNDER_MEMBER_LINK":
+        try: uid=int(text)
+        except ValueError: await update.message.reply_text("أرسل ID صحيحًا."); return True
+        if not db.get_user(uid): await update.message.reply_text("العضو غير موجود."); return True
+        links=[]
+        targets=list(PLATFORMS)+[COMMON_PLATFORM]
+        for platform in targets:
+            group=db.get_group(platform)
+            if group:
+                link=await make_member_invite(context.bot,group["chat_id"],uid,platform)
+                if link: links.append(f"{PLATFORM_LABELS.get(platform,'الكروب العام')}: {link}")
+        db.clear_session(user_id)
+        await context.bot.send_message(uid,"روابط الدخول الخاصة بك:\n\n"+"\n".join(links) if links else "تعذر إنشاء الروابط حاليًا.")
+        await update.message.reply_text("تم إصدار الروابط وإرسالها للعضو.",reply_markup=founder_users_keyboard()); return True
+
+    if state == "FOUNDER_SET_DEPARTMENT":
+        try: uid_s,dept=text.split("|",1); uid=int(uid_s.strip()); dept=dept.strip().lower()
+        except ValueError: await update.message.reply_text("الصيغة: ID | programming أو band"); return True
+        if dept not in ("programming","band"): await update.message.reply_text("القسم يجب أن يكون programming أو band."); return True
+        db.set_department(uid,dept); db.clear_session(user_id); await update.message.reply_text("تم تعيين القسم.",reply_markup=team_keyboard()); return True
+
+    if state == "FOUNDER_MEETING_NEW":
+        try: title,when,details,audience=[x.strip() for x in text.split("|",3)]
+        except ValueError: await update.message.reply_text("الصيغة غير صحيحة."); return True
+        aud=audience
+        if aud in ("programming","band"): aud="department:"+aud
+        elif aud in PLATFORMS: aud="platform:"+aud
+        elif aud!="all": await update.message.reply_text("الجمهور غير صحيح."); return True
+        try: datetime.fromisoformat(when)
+        except ValueError: await update.message.reply_text("صيغة الوقت يجب أن تكون ISO مثل 2026-09-13T20:00:00+03:00"); return True
+        mid=db.create_meeting(title,when,details,aud,user_id); db.clear_session(user_id)
+        await send_announcement(context.bot,"meeting",aud if aud=="all" else ("department" if aud.startswith("department:") else "platform"),db.get_template("template_meeting").format(title=title,time=when,details=details),user_id, aud.split(":",1)[1] if aud.startswith("department:") else None, aud.split(":",1)[1] if aud.startswith("platform:") else None)
+        await schedule_meeting_reminders(context.bot,mid)
+        await update.message.reply_text("تم إنشاء الاجتماع وجدولة التذكير قبل ساعة وقبل 10 دقائق.",reply_markup=meetings_keyboard()); return True
+
+    if state.startswith("FOUNDER_TEMPLATE_"):
+        key=state[len("FOUNDER_TEMPLATE_")]; db.set_template("template_"+key,text); db.clear_session(user_id); await update.message.reply_text("تم حفظ القالب.",reply_markup=announcements_keyboard()); return True
+
     try:
         if state == "FOUNDER_ADD_USER":
             uid_s, name = [
@@ -3071,72 +3375,30 @@ async def founder_text_router(update, context):
 
             uid = int(uid_s)
 
-            if uid == FOUNDER_ID:
-                raise ValueError
-
             db.add_user(
                 uid,
                 None,
                 name,
                 "member",
             )
-            db.cancel_member_invites(uid)
-
-            links = await create_private_member_links(
-                context.bot,
-                uid,
-            )
 
             db.clear_session(user_id)
 
-            if links:
-                lines = ["تمت إضافة العضو.", "", "روابط الدخول الخاصة به:"]
-                for platform, link in links:
-                    lines.append(f"{PLATFORM_LABELS.get(platform, 'الكروب العام')}: {link}")
-                lines.append("")
-                lines.append("هذه الروابط تعمل للعضو المحدد فقط، ويفضل إرسالها له مباشرة.")
-                text_out = "\n".join(lines)
-            else:
-                text_out = (
-                    "تمت إضافة العضو، لكن لم يتم إنشاء روابط دخول. "
-                    "تأكد من ضبط الكروبات ومنح البوت صلاحية دعوة الأعضاء."
-                )
-
             await update.message.reply_text(
-                text_out,
+                "تمت إضافة العضو.",
                 reply_markup=founder_keyboard(),
             )
-
-            # إرسال الروابط أيضًا في رسالة منفصلة للعضو إذا كان قد بدأ البوت.
-            if links:
-                try:
-                    lines = ["تمت إضافتك إلى التيم.", "", "روابط الدخول الخاصة بك:"]
-                    for platform, link in links:
-                        lines.append(f"{PLATFORM_LABELS.get(platform, 'الكروب العام')}: {link}")
-                    lines.append("")
-                    lines.append("لا تشارك هذه الروابط مع أي شخص آخر.")
-                    await context.bot.send_message(
-                        uid,
-                        "\n".join(lines),
-                    )
-                except TelegramError:
-                    pass
 
             return True
 
         if state == "FOUNDER_REMOVE_USER":
-            uid = int(text)
-            if uid == FOUNDER_ID:
-                raise ValueError
-
-            db.remove_user(uid)
-            db.cancel_member_invites(uid)
-            await kick_member_from_all_groups(context.bot, uid)
-
+            target=int(text)
+            removed=await kick_member_from_all_groups(context.bot,target)
+            db.remove_user(target)
             db.clear_session(user_id)
 
             await update.message.reply_text(
-                "تم حذف العضو وطرده من جميع أقسام التيم.",
+                f"تم حذف العضو وطرده من {removed} كروب.",
                 reply_markup=founder_keyboard(),
             )
 
@@ -3176,7 +3438,8 @@ async def founder_text_router(update, context):
             return True
 
         if state == "FOUNDER_REMOVE_ADMIN":
-            db.remove_admin(int(text))
+            parts=[x.strip() for x in text.split("|",1)]
+            db.remove_admin(int(parts[0]), parts[1].lower() if len(parts)>1 else None)
             db.clear_session(user_id)
 
             await update.message.reply_text(
@@ -3294,6 +3557,10 @@ def build_app():
     )
 
     app.add_handler(
+        MessageHandler(filters.StatusUpdate.CHAT_JOIN_REQUEST, member_join_request)
+    )
+
+    app.add_handler(
         CallbackQueryHandler(
             platform_callback,
             pattern=r"^platform:(telegram|instagram|tiktok)$",
@@ -3330,6 +3597,13 @@ def build_app():
 
     app.add_handler(
         CallbackQueryHandler(
+            feature_callback,
+            pattern=r"^f:(status|toggle|ann_kind|ann_aud|template):",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
             founder_callback,
             pattern=r"^founder:",
         )
@@ -3340,7 +3614,8 @@ def build_app():
             founder_action_callback,
             pattern=(
                 r"^f:(add_user|remove_user|list_users|"
-                r"add_admin|remove_admin|list_admins)$"
+                r"add_admin|remove_admin|list_admins|team_users|team_admins|team_status|"
+                r"member_link|set_department|ann_new|ann_list|templates|meeting_new|meeting_list)$"
             ),
         )
     )
@@ -3407,7 +3682,7 @@ def build_app():
     app.add_handler(
         CallbackQueryHandler(
             apply_department_callback,
-            pattern=r"^apply_dept:(instagram|telegram|both)$",
+            pattern=r"^apply_dept:(programming|band|instagram|telegram|both)$",
         )
     )
 
@@ -3438,12 +3713,6 @@ def build_app():
             & (filters.PHOTO | filters.VIDEO)
             & ~filters.COMMAND,
             founder_welcome_media_router,
-        )
-    )
-
-    app.add_handler(
-        ChatJoinRequestHandler(
-            member_join_request,
         )
     )
 
